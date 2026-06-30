@@ -71,6 +71,13 @@ function bindEvents() {
     renderBoardList();
   });
   elements.boardList.addEventListener("click", (event) => {
+    const deleteButton = event.target.closest("[data-delete-board-code]");
+    if (deleteButton) {
+      event.stopPropagation();
+      deleteBoard(deleteButton.dataset.deleteBoardCode);
+      return;
+    }
+
     const button = event.target.closest("[data-board-code]");
     if (!button) return;
     openBoard(button.dataset.boardCode);
@@ -200,6 +207,7 @@ function loadLocalBoard() {
         shareCode: state.shareCode,
         entries: parsed.entries || {},
       };
+      state.projectName = normalizeProjectName(state.projectName);
     } catch (error) {
       console.warn("Local board parse failed", error);
     }
@@ -224,7 +232,7 @@ async function loadCloudBoard() {
 
   if (board) {
     state.boardId = board.id;
-    state.projectName = board.project_name || DEFAULT_PROJECT_NAME;
+    state.projectName = normalizeProjectName(board.project_name || DEFAULT_PROJECT_NAME);
     state.pourPart = board.pour_part || "";
     state.pourDate = board.pour_date || toDateInputValue(new Date());
   } else {
@@ -242,7 +250,7 @@ async function loadCloudBoard() {
     if (insertError) throw insertError;
 
     state.boardId = created.id;
-    state.projectName = created.project_name || DEFAULT_PROJECT_NAME;
+    state.projectName = normalizeProjectName(created.project_name || DEFAULT_PROJECT_NAME);
     state.pourPart = created.pour_part || "";
     state.pourDate = created.pour_date || toDateInputValue(new Date());
   }
@@ -297,7 +305,7 @@ async function loadCloudBoardList() {
 
   boardList = (data || []).map((board) => ({
     shareCode: board.share_code,
-    projectName: board.project_name || DEFAULT_PROJECT_NAME,
+    projectName: normalizeProjectName(board.project_name || DEFAULT_PROJECT_NAME),
     pourPart: board.pour_part || "타설부위 미입력",
     pourDate: board.pour_date || "",
     updatedAt: board.updated_at || "",
@@ -315,7 +323,7 @@ function loadLocalBoardList() {
         const entries = parsed.entries || {};
         return {
           shareCode: key.slice(LOCAL_PREFIX.length),
-          projectName: parsed.projectName || DEFAULT_PROJECT_NAME,
+          projectName: normalizeProjectName(parsed.projectName || DEFAULT_PROJECT_NAME),
           pourPart: parsed.pourPart || "타설부위 미입력",
           pourDate: parsed.pourDate || "",
           updatedAt: parsed.updatedAt || "",
@@ -417,13 +425,14 @@ async function subscribeToChanges() {
 }
 
 function syncInputsFromState() {
+  state.projectName = normalizeProjectName(state.projectName);
   elements.projectNameInput.value = state.projectName || DEFAULT_PROJECT_NAME;
   elements.pourPartInput.value = state.pourPart || "";
   elements.pourDateInput.value = state.pourDate || "";
 }
 
 function pullMetaFromInputs() {
-  state.projectName = elements.projectNameInput.value.trim() || DEFAULT_PROJECT_NAME;
+  state.projectName = normalizeProjectName(elements.projectNameInput.value.trim() || DEFAULT_PROJECT_NAME);
   state.pourPart = elements.pourPartInput.value.trim();
   state.pourDate = elements.pourDateInput.value || "";
 }
@@ -609,13 +618,14 @@ function renderBoardList() {
     .map((board) => {
       const active = board.shareCode === state.shareCode;
       return `
-        <button class="board-list-item ${active ? "active" : ""}" type="button" data-board-code="${escapeAttribute(board.shareCode)}">
+        <div class="board-list-item ${active ? "active" : ""}" data-board-code="${escapeAttribute(board.shareCode)}">
           <span class="board-date">${escapeHtml(formatListDate(board.pourDate))}</span>
           <span class="board-part">${escapeHtml(board.pourPart)}</span>
           <span class="board-count ${board.completedCount === DAY_COUNT ? "complete" : ""}">
             ${board.completedCount}/${DAY_COUNT}
           </span>
-        </button>
+          <button class="board-delete-button" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제">×</button>
+        </div>
       `;
     })
     .join("");
@@ -629,11 +639,15 @@ function renderSummary() {
       return `
         <div class="summary-item ${done ? "done" : ""}">
           <div class="summary-day">
-            <span>${day}일차</span>
-            <span>${done ? "완료" : "대기"}</span>
+            <span>
+              <strong>${day}일차</strong>
+              <small>${formatDayDate(day)}</small>
+            </span>
+            <span>
+              <strong>${done ? "완료" : "대기"}</strong>
+              <small>${done ? "사진 등록됨" : "사진 미등록"}</small>
+            </span>
           </div>
-          <div class="summary-date">${formatDayDate(day)}</div>
-          <div class="summary-state">${done ? "사진 등록됨" : "사진 미등록"}</div>
         </div>
       `;
     })
@@ -655,7 +669,7 @@ function renderDayGrid() {
             ${
               hasPhoto
                 ? `<img src="${escapeAttribute(entry.photoUrl)}" alt="${day}일차 습윤양생 사진">`
-                : `<div class="empty-photo">사진 미등록</div>`
+                : `<div class="empty-photo"><strong>대기</strong><span>사진 미등록</span></div>`
             }
           </div>
           <div class="day-card-body">
@@ -695,7 +709,7 @@ function renderPrintArea() {
     .map((group) => {
       return `
         <div class="print-page">
-          <h2 class="print-title">사진대지</h2>
+          <h2 class="print-title">사 진 대 지</h2>
           <table class="print-sheet-table">
             <colgroup>
               <col class="print-col-label">
@@ -738,19 +752,19 @@ function renderPrintBlock(day) {
       </td>
     </tr>
     <tr class="print-info-row">
-      <td class="print-label">위&nbsp;&nbsp;&nbsp;&nbsp;치</td>
+      <td class="print-label">위&nbsp;&nbsp;치</td>
       <td class="print-main">${escapeHtml(locationText)}</td>
       <td class="print-day">${day}일차</td>
     </tr>
     <tr class="print-content-row">
-      <td class="print-label">사진내용</td>
+      <td class="print-label">내&nbsp;&nbsp;용</td>
       <td colspan="2" class="print-main">${escapeHtml(contentText)}</td>
     </tr>
   `;
 }
 
 function renderUploadedMeta(entry) {
-  if (!entry.photoUrl) return "등록된 사진이 없습니다.";
+  if (!entry.photoUrl) return "";
   const time = entry.uploadedAt ? formatDateTime(entry.uploadedAt) : "";
   return time ? `등록 ${escapeHtml(time)} · 자동 압축 저장` : "자동 압축 저장";
 }
@@ -776,6 +790,50 @@ function openBoard(shareCode) {
   const url = new URL(window.location.href);
   url.searchParams.set("board", shareCode);
   window.location.href = url.toString();
+}
+
+async function deleteBoard(shareCode) {
+  if (!shareCode) return;
+  const ok = window.confirm("이 사진대지를 목록에서 삭제할까요?");
+  if (!ok) return;
+
+  const target = boardList.find((board) => board.shareCode === shareCode);
+
+  if (dbClient) {
+    const { data: board, error } = await dbClient
+      .from("photo_boards")
+      .select("id")
+      .eq("share_code", shareCode)
+      .maybeSingle();
+
+    if (error) {
+      console.error(error);
+      showToast("사진대지 삭제에 실패했습니다.");
+      return;
+    }
+
+    if (board?.id) {
+      const { error: entryError } = await dbClient.from("photo_entries").delete().eq("board_id", board.id);
+      const { error: boardError } = await dbClient.from("photo_boards").delete().eq("id", board.id);
+      if (entryError || boardError) {
+        console.error(entryError || boardError);
+        showToast("사진대지 삭제에 실패했습니다.");
+        return;
+      }
+    }
+  } else {
+    localStorage.removeItem(LOCAL_PREFIX + shareCode);
+  }
+
+  showToast(`${target?.pourPart || "사진대지"}를 삭제했습니다.`);
+
+  if (shareCode === state.shareCode) {
+    createNewBoard();
+    return;
+  }
+
+  await loadBoardList();
+  renderBoardList();
 }
 
 function showToast(message) {
@@ -929,4 +987,8 @@ function escapeHtml(value) {
 
 function escapeAttribute(value) {
   return escapeHtml(value).replaceAll("`", "&#096;");
+}
+
+function normalizeProjectName(value) {
+  return String(value || DEFAULT_PROJECT_NAME).replaceAll("(주)서화", "(주)한화");
 }

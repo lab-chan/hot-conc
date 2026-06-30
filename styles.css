@@ -43,19 +43,20 @@ button {
 .app {
   width: min(1180px, calc(100% - 32px));
   margin: 0 auto;
-  padding: 28px 0 56px;
+  padding: 14px 0 36px;
 }
 
 .topbar {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 18px;
-  margin-bottom: 18px;
+  gap: 10px;
+  margin-bottom: 10px;
 }
 
 .eyebrow {
-  margin: 0 0 4px;
+  display: none;
+  margin: 0;
   color: var(--accent-dark);
   font-size: 14px;
   font-weight: 800;
@@ -70,14 +71,14 @@ p {
 
 h1 {
   margin-bottom: 0;
-  font-size: clamp(18px, 4vw, 34px);
+  font-size: clamp(17px, 3.2vw, 29px);
   line-height: 1.08;
   letter-spacing: 0;
 }
 
 h2 {
-  margin-bottom: 6px;
-  font-size: 20px;
+  margin-bottom: 0;
+  font-size: 18px;
   line-height: 1.25;
   letter-spacing: 0;
 }
@@ -102,15 +103,16 @@ p {
 }
 
 .topbar-actions {
-  flex-direction: column;
+  flex-direction: row;
   align-items: flex-end;
-  gap: 6px;
+  gap: 5px;
   margin-left: auto;
+  flex-wrap: nowrap;
 }
 
 .layout {
   display: grid;
-  gap: 18px;
+  gap: 8px;
 }
 
 .board-list-section,
@@ -121,7 +123,7 @@ p {
   border-radius: 8px;
   background: var(--surface);
   box-shadow: var(--shadow);
-  padding: 18px;
+  padding: 10px;
 }
 
 .panel-heading,
@@ -129,8 +131,12 @@ p {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 14px;
-  margin-bottom: 14px;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.control-panel .panel-heading {
+  align-items: flex-start;
 }
 
 .board-list-section .panel-heading {
@@ -145,7 +151,7 @@ p {
 .field-grid {
   display: grid;
   grid-template-columns: 1.1fr 1.5fr 0.8fr;
-  gap: 12px;
+  gap: 8px;
 }
 
 label span,
@@ -159,7 +165,7 @@ label span,
 
 input {
   width: 100%;
-  min-height: 44px;
+  min-height: 36px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
@@ -212,7 +218,7 @@ input:focus {
 .icon-button,
 .ghost-button,
 .small-button {
-  min-height: 40px;
+  min-height: 34px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -227,7 +233,7 @@ input:focus {
 .topbar-actions .primary-button,
 .topbar-actions .icon-button,
 .panel-heading > .ghost-button {
-  min-height: 32px;
+  min-height: 30px;
   gap: 5px;
   padding: 0 9px;
   font-size: 13px;
@@ -262,8 +268,8 @@ input:focus {
 }
 
 .button-icon {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   display: inline-grid;
   place-items: center;
   flex: 0 0 auto;
@@ -276,26 +282,59 @@ input:focus {
 
 .board-list {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-  gap: 8px;
-  max-height: 320px;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 6px;
+  max-height: 180px;
   overflow: auto;
   padding-right: 2px;
 }
 
 .board-list-item {
   min-width: 0;
-  min-height: 54px;
+  min-height: 40px;
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr) 52px;
+  grid-template-columns: 64px minmax(0, 1fr) 44px 28px;
   align-items: center;
-  gap: 8px;
+  gap: 5px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
-  padding: 8px 10px;
+  padding: 5px 6px;
   color: var(--ink);
   text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.board-open-button,
+.board-delete-button {
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.board-open-button {
+  display: contents;
+  text-align: left;
+}
+
+.board-delete-button {
+  width: 26px;
+  height: 26px;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--danger);
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.board-delete-button:hover {
+  background: #fff0ef;
 }
 
 .board-list-item:hover,
@@ -319,7 +358,7 @@ input:focus {
 }
 
 .board-count {
-  min-height: 30px;
+  min-height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -347,16 +386,16 @@ input:focus {
 .summary-list {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 16px;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .summary-item {
-  min-height: 74px;
+  min-height: 52px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fafbf9;
-  padding: 10px;
+  padding: 6px;
 }
 
 .summary-item.done {
@@ -372,27 +411,37 @@ input:focus {
   font-weight: 900;
 }
 
-.summary-date {
-  margin-top: 5px;
-  color: var(--muted);
+.summary-day > span {
+  display: grid;
+  gap: 1px;
+}
+
+.summary-day > span:last-child {
+  text-align: right;
+}
+
+.summary-day strong {
   font-size: 13px;
 }
 
-.summary-state {
-  margin-top: 5px;
+.summary-day small {
   color: var(--warn);
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 800;
 }
 
-.summary-item.done .summary-state {
+.summary-day > span:first-child small {
+  color: var(--muted);
+}
+
+.summary-item.done .summary-day > span:last-child small {
   color: var(--accent-dark);
 }
 
 .day-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .day-card {
@@ -412,23 +461,23 @@ input:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 12px;
+  gap: 6px;
+  padding: 7px;
   border-bottom: 1px solid var(--line);
   background: #fafbf9;
 }
 
 .day-card-header h3 {
   margin: 0;
-  font-size: 17px;
+  font-size: 15px;
   letter-spacing: 0;
 }
 
 .date-pill {
-  min-height: 30px;
+  min-height: 24px;
   display: inline-flex;
   align-items: center;
-  padding: 0 9px;
+  padding: 0 6px;
   border-radius: 999px;
   background: var(--surface-soft);
   color: var(--accent-dark);
@@ -440,7 +489,7 @@ input:focus {
 .photo-preview {
   position: relative;
   width: 100%;
-  aspect-ratio: 3 / 2;
+  aspect-ratio: 16 / 9;
   background:
     linear-gradient(135deg, rgba(31, 122, 90, 0.10), rgba(32, 35, 31, 0.03)),
     #f9faf8;
@@ -459,22 +508,33 @@ input:focus {
   height: 100%;
   display: grid;
   place-items: center;
-  padding: 20px;
+  align-content: center;
+  gap: 2px;
+  padding: 10px;
   color: var(--muted);
   text-align: center;
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 800;
+}
+
+.empty-photo strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.empty-photo span {
+  color: var(--muted);
 }
 
 .day-card-body {
   display: grid;
-  gap: 8px;
-  padding: 12px;
+  gap: 5px;
+  padding: 7px;
 }
 
 .upload-row {
   display: flex;
-  gap: 8px;
+  gap: 5px;
   flex-wrap: wrap;
 }
 
@@ -489,7 +549,7 @@ input:focus {
 .uploaded-meta {
   min-height: 21px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .day-card.swiping {
@@ -541,15 +601,15 @@ input:focus {
 }
 
 .print-col-label {
-  width: 11mm;
+  width: 22.03mm;
 }
 
 .print-col-main {
-  width: 133mm;
+  width: 113.89mm;
 }
 
 .print-col-day {
-  width: 8mm;
+  width: 16.08mm;
 }
 
 .print-photo-row {
@@ -565,8 +625,8 @@ input:focus {
 }
 
 .print-photo-frame {
-  width: 149mm;
-  height: 82mm;
+  width: 120mm;
+  height: 80mm;
   display: grid;
   place-items: center;
   margin: 0 auto;
@@ -627,8 +687,6 @@ input:focus {
 }
 
 @media (max-width: 900px) {
-  .topbar,
-  .panel-heading,
   .section-title-row {
     align-items: stretch;
     flex-direction: column;
@@ -641,17 +699,17 @@ input:focus {
 
   .topbar-actions,
   .list-tools {
-    justify-content: stretch;
+    justify-content: flex-end;
   }
 
   .topbar-actions {
-    align-items: stretch;
-    margin-left: 0;
+    align-items: center;
+    margin-left: auto;
   }
 
   .topbar-actions > *,
   .list-tools > * {
-    flex: 1 1 auto;
+    flex: 0 0 auto;
   }
 
   .month-nav {
@@ -659,8 +717,12 @@ input:focus {
   }
 
   .field-grid,
-  .day-grid {
+  .field-grid {
     grid-template-columns: 1fr;
+  }
+
+  .day-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .summary-list {
@@ -682,7 +744,7 @@ input:focus {
   }
 
   h1 {
-    font-size: 24px;
+    font-size: 19px;
   }
 
   .summary-list,
@@ -694,7 +756,7 @@ input:focus {
   .icon-button,
   .ghost-button,
   .small-button {
-    width: 100%;
+    width: auto;
   }
 
   .topbar-actions .primary-button,
