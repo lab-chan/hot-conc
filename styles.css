@@ -417,6 +417,16 @@ input:focus {
   line-height: 1.25;
 }
 
+.standard-block h2 a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.standard-block h2 a:hover {
+  color: var(--accent-dark);
+  text-decoration: underline;
+}
+
 .standard-block ul {
   display: grid;
   gap: 4px;
@@ -424,29 +434,13 @@ input:focus {
   padding-left: 16px;
   color: #303630;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
   line-height: 1.42;
 }
 
-.standard-source {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 5px 8px;
-  border-top: 1px solid var(--line);
-  padding-top: 8px;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.standard-source a {
-  color: var(--accent-dark);
-  text-decoration: none;
-}
-
-.standard-source a:hover {
-  text-decoration: underline;
+.standard-block li strong {
+  color: var(--ink);
+  font-weight: 900;
 }
 
 .board-search-bar {
@@ -650,6 +644,11 @@ input:focus {
   background: var(--accent-soft);
 }
 
+.summary-item.rain-hold:not(.done) {
+  border-color: rgba(41, 115, 178, 0.34);
+  background: #eaf4ff;
+}
+
 .summary-item:hover {
   border-color: rgba(31, 122, 90, 0.38);
   background: var(--surface-soft);
@@ -678,6 +677,10 @@ input:focus {
   color: var(--accent-dark) !important;
 }
 
+.summary-item.rain-hold:not(.done) .summary-status {
+  color: #1f5f9c !important;
+}
+
 .day-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -695,6 +698,10 @@ input:focus {
   border-color: rgba(31, 122, 90, 0.34);
 }
 
+.day-card.rain-hold:not(.complete) {
+  border-color: rgba(41, 115, 178, 0.34);
+}
+
 .day-card-header {
   display: flex;
   align-items: center;
@@ -706,13 +713,42 @@ input:focus {
 }
 
 .day-card-header h3 {
+  flex: 1 1 auto;
+  min-width: 0;
   margin: 0;
   font-size: 15px;
   letter-spacing: 0;
 }
 
+.rain-toggle {
+  width: 28px;
+  height: 24px;
+  flex: 0 0 28px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--muted);
+  padding: 0;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.rain-toggle:hover {
+  border-color: rgba(41, 115, 178, 0.36);
+  background: #f2f8ff;
+}
+
+.rain-toggle.active {
+  border-color: rgba(41, 115, 178, 0.46);
+  background: #dceeff;
+  color: #1f5f9c;
+}
+
 .date-pill {
   min-height: 24px;
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   padding: 0 6px;
@@ -777,6 +813,10 @@ input:focus {
 
 .empty-photo span {
   color: var(--muted);
+}
+
+.empty-photo.rain-hold span {
+  color: #1f5f9c;
 }
 
 .day-card-body {

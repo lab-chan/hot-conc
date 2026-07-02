@@ -20,6 +20,8 @@ const PRINT_PHOTO_ROW_HEIGHT_MM = 84;
 const PRINT_INFO_ROW_HEIGHT_MM = 10.525;
 const PRINT_PHOTO_WIDTH_MM = 120;
 const PRINT_PHOTO_HEIGHT_MM = 80;
+const PHOTO_MISSING_TEXT = "사진 미등록";
+const RAIN_HOLD_TEXT = "우천으로 인한 양생 대기";
 
 const elements = {
   standardButton: document.getElementById("standardButton"),
@@ -202,6 +204,12 @@ function bindEvents() {
   });
 
   elements.dayGrid.addEventListener("click", async (event) => {
+    const rainButton = event.target.closest("[data-rain-day]");
+    if (rainButton) {
+      await toggleRainHold(Number(rainButton.dataset.rainDay));
+      return;
+    }
+
     const previewButton = event.target.closest("[data-preview-day]");
     if (previewButton) {
       openPhotoViewer(Number(previewButton.dataset.previewDay));
@@ -410,11 +418,13 @@ async function loadCloudEntries() {
 function applyCloudEntries(entries) {
   state.entries = {};
   (entries || []).forEach((row) => {
+    const memo = parseEntryMemo(row.memo);
     state.entries[row.day_no] = {
       dayNo: row.day_no,
       photoUrl: row.photo_url || "",
       photoPath: row.photo_path || "",
       uploadedAt: row.uploaded_at || "",
+      rainHold: memo.rainHold,
     };
   });
 }
@@ -432,7 +442,7 @@ async function loadCloudBoardList() {
   const range = getListRange();
   let query = dbClient
     .from("photo_boards")
-    .select("id, share_code, project_name, pour_part, pour_date, created_at, updated_at, photo_entries(day_no, photo_url)")
+    .select("id, share_code, project_name, pour_part, pour_date, created_at, updated_at, photo_entries(day_no, photo_url, memo)")
     .not("pour_date", "is", null)
     .order("pour_date", { ascending: false })
     .order("created_at", { ascending: false });
@@ -453,7 +463,8 @@ async function loadCloudBoardList() {
       pourDate: board.pour_date || "",
       createdAt: board.created_at || "",
       updatedAt: board.updated_at || "",
-      completedCount: (board.photo_entries || []).filter((entry) => entry.photo_url).length,
+      completedCount: countCompletedEntries(board.photo_entries || []),
+      photoCount: countPhotoEntries(board.photo_entries || []),
     };
   });
 }
@@ -475,7 +486,8 @@ function loadLocalBoardList() {
           pourDate: parsed.pourDate || "",
           createdAt: parsed.createdAt || parsed.updatedAt || "",
           updatedAt: parsed.updatedAt || "",
-          completedCount: Object.values(entries).filter((entry) => entry && entry.photoUrl).length,
+          completedCount: countCompletedEntries(entries),
+          photoCount: countPhotoEntries(entries),
         };
       } catch {
         return null;
@@ -501,7 +513,7 @@ async function reconcileCurrentBoardEntries() {
   const current = boardList.find((board) => board.shareCode === state.shareCode);
   if (!current) return;
 
-  const detailCount = Object.values(state.entries || {}).filter((entry) => entry?.photoUrl).length;
+  const detailCount = countCompletedEntries(state.entries || {});
   const listCount = Number(current.completedCount || 0);
   if (detailCount === listCount) return;
 
@@ -517,7 +529,7 @@ function getListRange() {
 }
 
 function countVisibleBoardPhotos() {
-  return boardList.reduce((sum, board) => sum + Number(board.completedCount || 0), 0);
+  return boardList.reduce((sum, board) => sum + Number(board.photoCount ?? board.completedCount ?? 0), 0);
 }
 
 async function shiftPourDate(offset) {
@@ -731,7 +743,7 @@ async function persistEntry(day) {
           photo_url: entry.photoUrl || null,
           photo_path: entry.photoPath || null,
           uploaded_at: entry.uploadedAt || null,
-          memo: "",
+          memo: serializeEntryMemo(entry),
           updated_at: new Date().toISOString(),
         },
         { onConflict: "board_id,day_no" }
@@ -886,6 +898,7 @@ async function preparePhotoEntry(day, file) {
   entry.photoPath = "";
   entry.uploadedAt = new Date().toISOString();
   entry.sizeBytes = image.blob.size;
+  entry.rainHold = false;
 
   if (dbClient && state.boardId) {
     const path = `${state.shareCode}/day-${day}-${Date.now()}.jpg`;
@@ -957,6 +970,29 @@ async function deletePhoto(day) {
   }
 }
 
+async function toggleRainHold(day) {
+  if (!day) return;
+  if (!state.shareCode || (dbClient && !state.boardId)) {
+    showToast("새 대지를 먼저 만들어 주세요.");
+    return;
+  }
+
+  const entry = getEntry(day);
+  const previousRainHold = isRainHoldEntry(entry);
+  entry.rainHold = !previousRainHold;
+  renderAll();
+
+  const saved = await saveEntry(day);
+  if (!saved) {
+    entry.rainHold = previousRainHold;
+    renderAll();
+    showToast(`${day}일차 우천 설정 저장에 실패했습니다.`);
+    return;
+  }
+
+  showToast(entry.rainHold ? `${day}일차를 우천 대기로 표시했습니다.` : `${day}일차 우천 대기를 해제했습니다.`);
+}
+
 function getEntry(day) {
   if (!state.entries[day]) {
     state.entries[day] = {
@@ -964,9 +1000,56 @@ function getEntry(day) {
       photoUrl: "",
       photoPath: "",
       uploadedAt: "",
+      rainHold: false,
     };
   }
   return state.entries[day];
+}
+
+function isRainHoldEntry(entry) {
+  return entry?.rainHold === true || entry?.rainHold === "true";
+}
+
+function hasEntryPhoto(entry) {
+  return Boolean(entry?.photoUrl || entry?.photo_url);
+}
+
+function isCompletedEntry(entry) {
+  return hasEntryPhoto(entry) || isRainHoldEntry(entry) || parseEntryMemo(entry?.memo).rainHold;
+}
+
+function countCompletedEntries(entries) {
+  return Object.values(entries || {}).filter(isCompletedEntry).length;
+}
+
+function countPhotoEntries(entries) {
+  return Object.values(entries || {}).filter(hasEntryPhoto).length;
+}
+
+function getEmptyPhotoText(day) {
+  return isRainHoldEntry(getEntry(day)) ? RAIN_HOLD_TEXT : PHOTO_MISSING_TEXT;
+}
+
+function getPrintMissingPhotoText(day) {
+  return getEmptyPhotoText(day);
+}
+
+function parseEntryMemo(memo) {
+  if (!memo) return { rainHold: false };
+  if (typeof memo === "object") {
+    return { rainHold: memo.rainHold === true || memo.rainHold === "true" };
+  }
+
+  try {
+    const parsed = JSON.parse(memo);
+    return { rainHold: parsed?.rainHold === true || parsed?.rainHold === "true" };
+  } catch {
+    return { rainHold: false };
+  }
+}
+
+function serializeEntryMemo(entry) {
+  return isRainHoldEntry(entry) ? JSON.stringify({ rainHold: true }) : "";
 }
 
 function renderAll() {
@@ -1138,12 +1221,14 @@ function renderSummary() {
   elements.summaryList.innerHTML = days()
     .map((day) => {
       const entry = getEntry(day);
-      const done = Boolean(entry.photoUrl);
+      const hasPhoto = Boolean(entry.photoUrl);
+      const rainHold = isRainHoldEntry(entry);
+      const statusText = hasPhoto ? "등록" : rainHold ? "우천대기" : "미등록";
       return `
-        <button class="summary-item ${done ? "done" : ""}" type="button" data-summary-day="${day}">
+        <button class="summary-item ${hasPhoto ? "done" : ""} ${rainHold ? "rain-hold" : ""}" type="button" data-summary-day="${day}">
           <strong>${day}일차</strong>
           <small>${formatCompactDayDate(day)}</small>
-          <span class="summary-status">${done ? "등록" : "미등록"}</span>
+          <span class="summary-status">${statusText}</span>
         </button>
       `;
     })
@@ -1166,10 +1251,15 @@ function renderDayGrid() {
     .map((day) => {
       const entry = getEntry(day);
       const hasPhoto = Boolean(entry.photoUrl);
+      const rainHold = isRainHoldEntry(entry);
+      const emptyPhotoText = getEmptyPhotoText(day);
       return `
-        <article class="day-card ${hasPhoto ? "complete" : ""}" data-day-card="${day}">
+        <article class="day-card ${hasPhoto ? "complete" : ""} ${rainHold ? "rain-hold" : ""}" data-day-card="${day}">
           <div class="day-card-header">
             <h3>${day}일차</h3>
+            <button class="rain-toggle ${rainHold ? "active" : ""}" type="button" data-rain-day="${day}" aria-pressed="${rainHold}" title="${day}일차 우천 대기 표시" aria-label="${day}일차 우천 대기 표시">
+              <span aria-hidden="true">☔</span>
+            </button>
             <span class="date-pill">${formatDayDate(day)}</span>
           </div>
           <div class="photo-preview">
@@ -1178,7 +1268,7 @@ function renderDayGrid() {
                 ? `<button class="photo-preview-button" type="button" data-preview-day="${day}" title="${day}일차 사진 크게 보기">
                     <img src="${escapeAttribute(entry.photoUrl)}" alt="${day}일차 습윤양생 사진" loading="lazy" decoding="async">
                   </button>`
-                : `<div class="empty-photo"><span>사진 미등록</span></div>`
+                : `<div class="empty-photo ${rainHold ? "rain-hold" : ""}"><span>${escapeHtml(emptyPhotoText)}</span></div>`
             }
           </div>
           <div class="day-card-body">
@@ -1262,7 +1352,7 @@ function renderPrintBlock(day) {
           ${
             entry.photoUrl
               ? `<img src="${escapeAttribute(entry.photoUrl)}" alt="${day}일차 습윤양생 사진" loading="lazy" decoding="async">`
-              : `<span class="print-placeholder">${day}일차 사진 미등록</span>`
+              : `<span class="print-placeholder">${escapeHtml(getPrintMissingPhotoText(day))}</span>`
           }
         </div>
       </td>
@@ -1349,10 +1439,11 @@ function closePhotoViewer() {
 function getPrintImageSignature() {
   const entries = days().map((day) => {
     const entry = getEntry(day);
-    return [day, entry.photoUrl || "", entry.uploadedAt || ""];
+    return [day, entry.photoUrl || "", entry.uploadedAt || "", isRainHoldEntry(entry)];
   });
 
   return JSON.stringify({
+    projectName: state.projectName || "",
     pourPart: state.pourPart || "",
     pourDate: state.pourDate || "",
     entries,
@@ -1428,6 +1519,7 @@ function drawPrintPage(group, photos, allowPhotos) {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   drawPrintTitle(ctx);
+  drawPrintProjectName(ctx);
   drawPrintTable(ctx, group, photos, allowPhotos);
 
   return canvas;
@@ -1453,6 +1545,23 @@ function drawPrintTitle(ctx) {
   ctx.moveTo(pageWidth / 2 - metrics.width / 2, underlineY);
   ctx.lineTo(pageWidth / 2 + metrics.width / 2, underlineY);
   ctx.stroke();
+  ctx.restore();
+}
+
+function drawPrintProjectName(ctx) {
+  const tableX = printMm((PRINT_PAGE_WIDTH_MM - PRINT_TABLE_WIDTH_MM) / 2);
+  const titleHeightMm = 22 * 25.4 / 72;
+  const tableY = printMm(15 + titleHeightMm + 16.9);
+  const text = `□ ${normalizeProjectName(state.projectName || DEFAULT_PROJECT_NAME)}`;
+  const fontPx = printPt(11);
+  const textY = tableY - printMm(5.8);
+
+  ctx.save();
+  ctx.fillStyle = "#000000";
+  ctx.font = `${fontPx}px "Batang", "HCR Batang", serif`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(fitPrintCanvasText(ctx, text, printMm(PRINT_TABLE_WIDTH_MM)), tableX, textY);
   ctx.restore();
 }
 
@@ -1520,7 +1629,7 @@ function drawPrintPhoto(ctx, day, x, y, width, height, image, allowPhotos) {
   if (allowPhotos && image) {
     drawCoverImage(ctx, image, photoX, photoY, photoW, photoH);
   } else {
-    drawCenteredPrintText(ctx, `${day}일차 사진 미등록`, photoX, photoY, photoW, photoH, 13, "Batang, serif");
+    drawCenteredPrintText(ctx, getPrintMissingPhotoText(day), photoX, photoY, photoW, photoH, 13, "Batang, serif");
   }
 
   ctx.restore();
