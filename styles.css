@@ -856,6 +856,30 @@ input:focus {
   print-color-adjust: exact;
 }
 
+.print-render-loading {
+  width: 210mm;
+  min-height: 120mm;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  background: #fff !important;
+  color: #000 !important;
+  font-weight: 800;
+}
+
+.print-raster-page {
+  width: 210mm;
+  height: auto;
+  display: block;
+  background: #fff !important;
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  color-scheme: only light;
+  forced-color-adjust: none;
+  filter: none !important;
+  mix-blend-mode: normal !important;
+}
+
 .print-page {
   width: 210mm;
   min-height: 297mm;
@@ -1303,6 +1327,21 @@ body.viewer-open {
 
   .print-page:last-child {
     page-break-after: auto;
+  }
+
+  .print-raster-page {
+    width: 210mm;
+    height: 297mm;
+    margin: 0;
+    border: 0;
+    box-shadow: none;
+    page-break-after: always;
+    break-after: page;
+  }
+
+  .print-raster-page:last-child {
+    page-break-after: auto;
+    break-after: auto;
   }
 
   .print-title {

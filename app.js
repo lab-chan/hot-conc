@@ -7,6 +7,19 @@ const ESTIMATED_PHOTO_BYTES = 450 * 1024;
 const IMAGE_MAX_WIDTH = 1280;
 const IMAGE_MAX_HEIGHT = 853;
 const IMAGE_QUALITY = 0.7;
+const PRINT_PAGE_GROUPS = [[1, 2], [3, 4], [5, null]];
+const PRINT_MM_SCALE = 6;
+const PRINT_PAGE_WIDTH_MM = 210;
+const PRINT_PAGE_HEIGHT_MM = 297;
+const PRINT_TABLE_WIDTH_MM = 152.02;
+const PRINT_TABLE_HEIGHT_MM = 210.1;
+const PRINT_LABEL_WIDTH_MM = 22.03;
+const PRINT_MAIN_WIDTH_MM = 113.91;
+const PRINT_DAY_WIDTH_MM = 16.08;
+const PRINT_PHOTO_ROW_HEIGHT_MM = 84;
+const PRINT_INFO_ROW_HEIGHT_MM = 10.525;
+const PRINT_PHOTO_WIDTH_MM = 120;
+const PRINT_PHOTO_HEIGHT_MM = 80;
 
 const elements = {
   standardButton: document.getElementById("standardButton"),
@@ -48,6 +61,12 @@ let filePickerClearTimer = null;
 let pendingRealtimeRefresh = false;
 let activePhotoMutationCount = 0;
 let boardLoadToken = 0;
+let printPreviewRenderToken = 0;
+let printPreviewTimer = null;
+let printImageCache = {
+  signature: "",
+  images: [],
+};
 
 let state = {
   shareCode: "",
@@ -1190,24 +1209,34 @@ function renderDayGrid() {
 }
 
 function renderPrintArea() {
-  const groupedDays = [[1, 2], [3, 4], [5, null]];
-  elements.printArea.innerHTML = groupedDays
-    .map((group) => {
-      return `
-        <div class="print-page">
-          <h2 class="print-title">사 진 대 지</h2>
-          <table class="print-sheet-table">
-            <colgroup>
-              <col class="print-col-label">
-              <col class="print-col-main">
-              <col class="print-col-day">
-            </colgroup>
-            <tbody>
-              ${group.map(renderPrintBlock).join("")}
-            </tbody>
-          </table>
-        </div>
-      `;
+  const signature = getPrintImageSignature();
+  const token = ++printPreviewRenderToken;
+
+  window.clearTimeout(printPreviewTimer);
+
+  if (printImageCache.signature === signature && printImageCache.images.length) {
+    renderPrintPreviewImages(printImageCache.images);
+    return;
+  }
+
+  elements.printArea.innerHTML = `<div class="print-render-loading">출력 미리보기 준비 중</div>`;
+  printPreviewTimer = window.setTimeout(async () => {
+    try {
+      const images = await getPrintPageImages();
+      if (token !== printPreviewRenderToken) return;
+      renderPrintPreviewImages(images);
+    } catch (error) {
+      console.error(error);
+      if (token !== printPreviewRenderToken) return;
+      elements.printArea.innerHTML = `<div class="print-render-loading">출력 미리보기를 만들지 못했습니다.</div>`;
+    }
+  }, 80);
+}
+
+function renderPrintPreviewImages(images) {
+  elements.printArea.innerHTML = images
+    .map((src, index) => {
+      return `<img class="print-raster-page" src="${escapeAttribute(src)}" alt="사진대지 ${index + 1}쪽">`;
     })
     .join("");
 }
@@ -1317,24 +1346,453 @@ function closePhotoViewer() {
   document.body.classList.remove("viewer-open");
 }
 
+function getPrintImageSignature() {
+  const entries = days().map((day) => {
+    const entry = getEntry(day);
+    return [day, entry.photoUrl || "", entry.uploadedAt || ""];
+  });
+
+  return JSON.stringify({
+    pourPart: state.pourPart || "",
+    pourDate: state.pourDate || "",
+    entries,
+  });
+}
+
+async function getPrintPageImages() {
+  const signature = getPrintImageSignature();
+  if (printImageCache.signature === signature && printImageCache.images.length) {
+    return printImageCache.images;
+  }
+
+  const photos = await loadPrintPhotos();
+  const images = PRINT_PAGE_GROUPS.map((group) => createPrintPageImage(group, photos));
+  printImageCache = { signature, images };
+  return images;
+}
+
+async function loadPrintPhotos() {
+  const photoPairs = await Promise.all(
+    days().map(async (day) => {
+      const photoUrl = getEntry(day).photoUrl;
+      if (!photoUrl) return [day, null];
+      const image = await loadPrintPhoto(photoUrl);
+      return [day, image];
+    })
+  );
+
+  return Object.fromEntries(photoPairs);
+}
+
+function loadPrintPhoto(src) {
+  return new Promise((resolve) => {
+    const image = new Image();
+    if (!String(src).startsWith("data:")) {
+      image.crossOrigin = "anonymous";
+    }
+    image.onload = () => resolve(image);
+    image.onerror = () => resolve(null);
+    image.src = src;
+  });
+}
+
+function createPrintPageImage(group, photos) {
+  let canvas = drawPrintPage(group, photos, true);
+  try {
+    return canvas.toDataURL("image/png");
+  } catch (error) {
+    console.warn("Photo canvas export failed. Retrying without photos.", error);
+    canvas = drawPrintPage(group, photos, false);
+    return canvas.toDataURL("image/png");
+  }
+}
+
+function printMm(value) {
+  return value * PRINT_MM_SCALE;
+}
+
+function printPt(value) {
+  return value * (96 / 72) * (PRINT_MM_SCALE / (96 / 25.4));
+}
+
+function drawPrintPage(group, photos, allowPhotos) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(printMm(PRINT_PAGE_WIDTH_MM));
+  canvas.height = Math.round(printMm(PRINT_PAGE_HEIGHT_MM));
+
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  drawPrintTitle(ctx);
+  drawPrintTable(ctx, group, photos, allowPhotos);
+
+  return canvas;
+}
+
+function drawPrintTitle(ctx) {
+  const pageWidth = printMm(PRINT_PAGE_WIDTH_MM);
+  const titleY = printMm(15);
+  const fontPx = printPt(22);
+
+  ctx.save();
+  ctx.fillStyle = "#000000";
+  ctx.font = `900 ${fontPx}px "HYHeadLine-M", "Malgun Gothic", sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillText("사 진 대 지", pageWidth / 2, titleY);
+
+  const metrics = ctx.measureText("사 진 대 지");
+  const underlineY = titleY + fontPx + printMm(1);
+  ctx.lineWidth = printMm(0.45);
+  ctx.strokeStyle = "#000000";
+  ctx.beginPath();
+  ctx.moveTo(pageWidth / 2 - metrics.width / 2, underlineY);
+  ctx.lineTo(pageWidth / 2 + metrics.width / 2, underlineY);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawPrintTable(ctx, group, photos, allowPhotos) {
+  const tableX = printMm((PRINT_PAGE_WIDTH_MM - PRINT_TABLE_WIDTH_MM) / 2);
+  const titleHeightMm = 22 * 25.4 / 72;
+  const tableY = printMm(15 + titleHeightMm + 16.9);
+  const blockHeight = printMm(PRINT_TABLE_HEIGHT_MM / 2);
+
+  group.forEach((day, index) => {
+    drawPrintBlockCanvas(ctx, day, tableX, tableY + blockHeight * index, photos, allowPhotos);
+  });
+}
+
+function drawPrintBlockCanvas(ctx, day, x, y, photos, allowPhotos) {
+  const tableW = printMm(PRINT_TABLE_WIDTH_MM);
+  const labelW = printMm(PRINT_LABEL_WIDTH_MM);
+  const mainW = printMm(PRINT_MAIN_WIDTH_MM);
+  const dayW = printMm(PRINT_DAY_WIDTH_MM);
+  const photoH = printMm(PRINT_PHOTO_ROW_HEIGHT_MM);
+  const infoH = printMm(PRINT_INFO_ROW_HEIGHT_MM);
+  const contentH = printMm(PRINT_INFO_ROW_HEIGHT_MM);
+  const infoY = y + photoH;
+  const contentY = infoY + infoH;
+
+  drawPrintCell(ctx, x, y, tableW, photoH);
+  drawPrintCell(ctx, x, infoY, labelW, infoH);
+  drawPrintCell(ctx, x + labelW, infoY, mainW, infoH);
+  drawPrintCell(ctx, x + labelW + mainW, infoY, dayW, infoH);
+  drawPrintCell(ctx, x, contentY, labelW, contentH);
+  drawPrintCell(ctx, x + labelW, contentY, mainW + dayW, contentH);
+
+  if (!day) return;
+
+  drawPrintPhoto(ctx, day, x, y, tableW, photoH, photos[day], allowPhotos);
+  drawCenteredPrintText(ctx, "위  치", x, infoY, labelW, infoH, 13, "Batang, serif");
+  drawPrintMainTextCanvas(ctx, state.pourPart || "", x + labelW, infoY, mainW, infoH, {
+    breakAfterFirstBracket: true,
+  });
+  drawCenteredPrintText(ctx, `${day}일차`, x + labelW + mainW, infoY, dayW, infoH, 13, "Batang, serif");
+  drawCenteredPrintText(ctx, "내  용", x, contentY, labelW, contentH, 13, "Batang, serif");
+  drawPrintMainTextCanvas(ctx, "습윤양생", x + labelW, contentY, mainW + dayW, contentH);
+}
+
+function drawPrintCell(ctx, x, y, width, height) {
+  ctx.save();
+  ctx.fillStyle = "#ffffff";
+  ctx.strokeStyle = "#000000";
+  ctx.lineWidth = Math.max(1, printMm(0.12));
+  ctx.fillRect(x, y, width, height);
+  ctx.strokeRect(x, y, width, height);
+  ctx.restore();
+}
+
+function drawPrintPhoto(ctx, day, x, y, width, height, image, allowPhotos) {
+  const photoW = printMm(PRINT_PHOTO_WIDTH_MM);
+  const photoH = printMm(PRINT_PHOTO_HEIGHT_MM);
+  const photoX = x + (width - photoW) / 2;
+  const photoY = y + (height - photoH) / 2;
+
+  ctx.save();
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(photoX, photoY, photoW, photoH);
+
+  if (allowPhotos && image) {
+    drawCoverImage(ctx, image, photoX, photoY, photoW, photoH);
+  } else {
+    drawCenteredPrintText(ctx, `${day}일차 사진 미등록`, photoX, photoY, photoW, photoH, 13, "Batang, serif");
+  }
+
+  ctx.restore();
+}
+
+function drawCoverImage(ctx, image, x, y, width, height) {
+  const sourceRatio = image.naturalWidth / image.naturalHeight;
+  const targetRatio = width / height;
+  let sx = 0;
+  let sy = 0;
+  let sw = image.naturalWidth;
+  let sh = image.naturalHeight;
+
+  if (sourceRatio > targetRatio) {
+    sw = image.naturalHeight * targetRatio;
+    sx = (image.naturalWidth - sw) / 2;
+  } else {
+    sh = image.naturalWidth / targetRatio;
+    sy = (image.naturalHeight - sh) / 2;
+  }
+
+  ctx.drawImage(image, sx, sy, sw, sh, x, y, width, height);
+}
+
+function drawCenteredPrintText(ctx, text, x, y, width, height, fontPt, fontFamily) {
+  ctx.save();
+  ctx.fillStyle = "#000000";
+  ctx.font = `${printPt(fontPt)}px ${fontFamily}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, x + width / 2, y + height / 2);
+  ctx.restore();
+}
+
+function drawPrintMainTextCanvas(ctx, text, x, y, width, height, options = {}) {
+  const paddingX = printMm(1.8);
+  const fontPt = getPrintCanvasFontPt(text);
+  const fontPx = printPt(fontPt);
+  const lineHeight = fontPx * 1.12;
+  const textX = x + paddingX;
+  const textWidth = width - paddingX * 2;
+
+  ctx.save();
+  ctx.fillStyle = "#000000";
+  ctx.font = `${fontPx}px "Batang", "HCR Batang", serif`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  const lines = getPrintCanvasLines(ctx, text, textWidth, 2, options);
+  const startY = y + height / 2 - ((lines.length - 1) * lineHeight) / 2;
+
+  lines.forEach((line, index) => {
+    ctx.fillText(line, textX, startY + index * lineHeight);
+  });
+
+  ctx.restore();
+}
+
+function getPrintCanvasFontPt(text) {
+  const lengthScore = getPrintTextLengthScore(text);
+  if (lengthScore > 70) return 10;
+  if (lengthScore > 52) return 11.5;
+  return 13;
+}
+
+function getPrintCanvasLines(ctx, value, maxWidth, maxLines, options = {}) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return [""];
+
+  const segments = getPrintCanvasSegments(text, options);
+  const lines = [];
+
+  segments.forEach((segment) => {
+    if (lines.length >= maxLines) return;
+    wrapPrintCanvasSegment(ctx, segment, maxWidth).forEach((line) => {
+      if (lines.length < maxLines) {
+        lines.push(line);
+      }
+    });
+  });
+
+  if (!lines.length) return [""];
+
+  const hasHiddenText = segments.join(" ").length > lines.join(" ").length;
+  if (hasHiddenText && lines.length >= maxLines) {
+    lines[maxLines - 1] = fitPrintCanvasText(ctx, lines[maxLines - 1], maxWidth, "…");
+  }
+
+  return lines.slice(0, maxLines);
+}
+
+function getPrintCanvasSegments(text, options = {}) {
+  if (!options.breakAfterFirstBracket || getPrintTextLengthScore(text) <= 18) {
+    return [text];
+  }
+
+  const chars = Array.from(text);
+  const breakIndex = chars.findIndex((char, index) => {
+    return [")", "]", "}"].includes(char) && index < chars.length - 1;
+  });
+
+  if (breakIndex < 0) return [text];
+  return [
+    chars.slice(0, breakIndex + 1).join("").trim(),
+    chars.slice(breakIndex + 1).join("").trim(),
+  ].filter(Boolean);
+}
+
+function wrapPrintCanvasSegment(ctx, segment, maxWidth) {
+  if (ctx.measureText(segment).width <= maxWidth) return [segment];
+
+  const tokens = segment.split(/(\s+)/).filter(Boolean);
+  const lines = [];
+  let line = "";
+
+  tokens.forEach((token) => {
+    const candidate = `${line}${token}`;
+    if (!line || ctx.measureText(candidate).width <= maxWidth) {
+      line = candidate;
+      return;
+    }
+
+    lines.push(fitPrintCanvasText(ctx, line.trim(), maxWidth));
+    line = token.trimStart();
+  });
+
+  if (line) {
+    lines.push(fitPrintCanvasText(ctx, line.trim(), maxWidth));
+  }
+
+  return lines;
+}
+
+function fitPrintCanvasText(ctx, text, maxWidth, suffix = "") {
+  let chars = Array.from(String(text || ""));
+  while (chars.length && ctx.measureText(`${chars.join("")}${suffix}`).width > maxWidth) {
+    chars.pop();
+  }
+  return `${chars.join("")}${suffix}`;
+}
+
 async function handlePrint() {
   if (isKakaoInAppBrowser()) {
     showToast("카톡 안에서는 인쇄가 막힐 수 있습니다. 브라우저로 열어서 인쇄해 주세요.");
     return;
   }
 
+  const printWindow = window.open("", "_blank");
+  if (!printWindow) {
+    showToast("새 창이 차단됐습니다. 팝업을 허용한 뒤 PDF를 다시 눌러 주세요.");
+    return;
+  }
+
+  writePrintLoadingDocument(printWindow);
   elements.printButton.disabled = true;
   showToast("출력 이미지를 준비하는 중입니다.");
   try {
-    await ensurePrintImagesReady();
-    window.print();
+    const images = await getPrintPageImages();
+    writeRasterPrintDocument(printWindow, images);
   } catch (error) {
     console.error(error);
-    showToast("일부 사진 확인 후 인쇄창을 엽니다.");
-    window.print();
+    printWindow.close();
+    showToast("출력 이미지를 만들지 못했습니다.");
   } finally {
     elements.printButton.disabled = false;
   }
+}
+
+function writePrintLoadingDocument(printWindow) {
+  printWindow.document.open();
+  printWindow.document.write(`<!doctype html>
+    <html lang="ko">
+      <head>
+        <meta charset="utf-8">
+        <meta name="color-scheme" content="light">
+        <title>PDF 출력 준비</title>
+        <style>
+          html, body { margin: 0; background: #fff; color: #000; color-scheme: light; }
+          body { display: grid; min-height: 100vh; place-items: center; font-family: sans-serif; }
+        </style>
+      </head>
+      <body>출력 이미지를 준비하는 중입니다.</body>
+    </html>`);
+  printWindow.document.close();
+}
+
+function writeRasterPrintDocument(printWindow, images) {
+  const pages = images
+    .map((src, index) => `<img class="page" src="${escapeAttribute(src)}" alt="사진대지 ${index + 1}쪽">`)
+    .join("");
+
+  printWindow.document.open();
+  printWindow.document.write(`<!doctype html>
+    <html lang="ko">
+      <head>
+        <meta charset="utf-8">
+        <meta name="color-scheme" content="light">
+        <meta name="darkreader-lock">
+        <title>사진대지 PDF 출력</title>
+        <style>
+          @page { size: A4 portrait; margin: 0; }
+          html, body {
+            margin: 0;
+            padding: 0;
+            background: #fff !important;
+            color: #000 !important;
+            color-scheme: light;
+          }
+          body {
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+          }
+          .page {
+            display: block;
+            width: 210mm;
+            height: 297mm;
+            margin: 0;
+            background: #fff !important;
+            page-break-after: always;
+            break-after: page;
+            filter: none !important;
+            mix-blend-mode: normal !important;
+          }
+          .page:last-child {
+            page-break-after: auto;
+            break-after: auto;
+          }
+          @media screen {
+            body {
+              display: grid;
+              gap: 12px;
+              justify-content: center;
+              padding: 12px;
+            }
+            .page {
+              border: 1px solid #ddd;
+              box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+            }
+          }
+        </style>
+      </head>
+      <body>
+        ${pages}
+        <script>
+          (() => {
+            const images = Array.from(document.images);
+            let remaining = images.length;
+            const start = () => setTimeout(() => {
+              window.focus();
+              window.print();
+            }, 100);
+            const done = () => {
+              remaining -= 1;
+              if (remaining <= 0) start();
+            };
+            if (!remaining) {
+              start();
+              return;
+            }
+            images.forEach((image) => {
+              if (image.complete) {
+                done();
+              } else {
+                image.onload = done;
+                image.onerror = done;
+              }
+            });
+          })();
+        </script>
+      </body>
+    </html>`);
+  printWindow.document.close();
 }
 
 async function ensurePrintImagesReady() {
