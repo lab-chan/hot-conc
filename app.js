@@ -9,6 +9,8 @@ const IMAGE_MAX_HEIGHT = 853;
 const IMAGE_QUALITY = 0.7;
 
 const elements = {
+  standardButton: document.getElementById("standardButton"),
+  standardPanel: document.getElementById("standardPanel"),
   searchButton: document.getElementById("searchButton"),
   printButton: document.getElementById("printButton"),
   newBoardButton: document.getElementById("newBoardButton"),
@@ -189,6 +191,7 @@ function applyRuntimeLayoutFixes() {
 }
 
 function bindEvents() {
+  elements.standardButton.addEventListener("click", toggleStandardPanel);
   elements.searchButton.addEventListener("click", toggleBoardSearch);
   elements.boardSearchInput.addEventListener("compositionstart", () => {
     isBoardSearchComposing = true;
@@ -310,6 +313,12 @@ function bindEvents() {
       closePhotoViewer();
     }
   });
+}
+
+function toggleStandardPanel() {
+  const willOpen = elements.standardPanel.hidden;
+  elements.standardPanel.hidden = !willOpen;
+  elements.standardButton.setAttribute("aria-expanded", String(willOpen));
 }
 
 function canUseCloud() {
