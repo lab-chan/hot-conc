@@ -129,6 +129,7 @@ const config = window.CONCRETE_PHOTO_CONFIG || {};
 let dbClient = null;
 let realtimeChannel = null;
 let metaSaveTimer = null;
+let lastSyncedMeta = { pourPart: "", pourDate: "" };
 let boardList = [];
 let boardSearchQuery = "";
 let boardListRenderFrame = 0;
@@ -227,13 +228,6 @@ function bindEvents() {
     }
   });
   elements.boardList.addEventListener("click", (event) => {
-    const deleteButton = event.target.closest("[data-delete-board-code]");
-    if (deleteButton) {
-      event.stopPropagation();
-      deleteBoard(deleteButton.dataset.deleteBoardCode);
-      return;
-    }
-
     const button = event.target.closest("[data-board-code]");
     if (!button) return;
     openBoard(button.dataset.boardCode);
@@ -252,12 +246,12 @@ function bindEvents() {
 
   window.addEventListener("pagehide", () => {
     if (isFilePickerOpen) return;
-    flushMetaSave();
+    flushMetaSave({ silent: true });
   });
   document.addEventListener("visibilitychange", () => {
     if (isFilePickerOpen) return;
     if (document.visibilityState === "hidden") {
-      flushMetaSave();
+      flushMetaSave({ silent: true });
     }
   });
   window.addEventListener("focus", endFilePickSoon);
@@ -753,6 +747,7 @@ function resetCurrentBoard(options = {}) {
     createdAt: "",
     entries: {},
   };
+  lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
   syncInputsFromState();
 }
 
@@ -790,6 +785,7 @@ function loadLocalBoard() {
   }
 
   applyMetaDraft("");
+  lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
   syncInputsFromState();
   saveLocalBoard();
 }
@@ -850,6 +846,7 @@ async function loadCloudBoard(options = {}) {
     syncInputsFromState();
   }
 
+  lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
   return usedDraft;
 }
 
@@ -1085,18 +1082,37 @@ function queueMetaSave() {
   metaSaveTimer = window.setTimeout(saveMeta, 300);
 }
 
-function flushMetaSave() {
+function flushMetaSave(options = {}) {
   pullMetaFromInputs();
   saveMetaDraft();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
-  saveMeta().catch(console.error);
+  saveMeta(options).catch(console.error);
 }
 
-async function saveMeta() {
+async function saveMeta(options = {}) {
+  const silent = options.silent === true;
   pullMetaFromInputs();
+
+  if (!state.pourDate) {
+    state.pourDate = lastSyncedMeta.pourDate || toDateInputValue(new Date());
+    elements.pourDateInput.value = state.pourDate;
+    if (!silent) showToast("타설일은 비워둘 수 없어요.");
+  }
+
   if (!state.shareCode) return;
   if (dbClient && !state.boardId) return;
+
+  if (countPhotoEntries(state.entries || {}) > 0 && metaChangedFromSynced()) {
+    if (silent) return;
+    const ok = window.confirm(
+      `이미 사진이 등록된 대지입니다.\n\n${describeMetaChange()}\n\n이대로 저장할까요?`
+    );
+    if (!ok) {
+      revertMetaInputsToSynced();
+      return;
+    }
+  }
 
   if (dbClient && state.boardId) {
     const { error } = await dbClient
@@ -1116,16 +1132,40 @@ async function saveMeta() {
     }
 
     clearMetaDraft();
+    lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
     await loadBoardList();
     renderBoardList();
     renderStorageMeter();
   } else {
     saveLocalBoard();
     clearMetaDraft();
+    lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
     await loadBoardList();
     renderBoardList();
     renderStorageMeter();
   }
+}
+
+function metaChangedFromSynced() {
+  return state.pourPart !== lastSyncedMeta.pourPart || state.pourDate !== lastSyncedMeta.pourDate;
+}
+
+function describeMetaChange() {
+  const lines = [];
+  if (state.pourPart !== lastSyncedMeta.pourPart) {
+    lines.push(`타설부위: ${lastSyncedMeta.pourPart || "(미입력)"} → ${state.pourPart || "(미입력)"}`);
+  }
+  if (state.pourDate !== lastSyncedMeta.pourDate) {
+    lines.push(`타설일: ${lastSyncedMeta.pourDate || "(미입력)"} → ${state.pourDate || "(미입력)"}`);
+  }
+  return lines.join("\n");
+}
+
+function revertMetaInputsToSynced() {
+  state.pourPart = lastSyncedMeta.pourPart;
+  state.pourDate = lastSyncedMeta.pourDate;
+  elements.pourPartInput.value = state.pourPart;
+  elements.pourDateInput.value = state.pourDate;
 }
 
 function saveMetaDraft() {
@@ -1745,28 +1785,6 @@ function countPhotoEntries(entries) {
   }, 0);
 }
 
-function collectPhotoStoragePaths(entries) {
-  const paths = [];
-  Object.values(entries || {}).forEach((entry) => {
-    const normalizedEntry = normalizeEntryShape({
-      photoPath: entry?.photoPath || entry?.photo_path || "",
-      memo: entry?.memo,
-      photos: entry?.photos || {},
-    });
-
-    const curingPath = getTypedPhoto(normalizedEntry, PHOTO_TYPES.CURING).photoPath;
-    if (curingPath) paths.push(curingPath);
-
-    Object.values(PHOTO_TYPES).forEach((photoType) => {
-      if (photoType === PHOTO_TYPES.CURING) return;
-      const path = getTypedPhoto(normalizedEntry, photoType).photoPath;
-      if (path) paths.push(path);
-    });
-  });
-
-  return Array.from(new Set(paths));
-}
-
 function getEmptyPhotoText(day, photoType = activePhotoType) {
   if (normalizePhotoType(photoType) === PHOTO_TYPES.CURING && isRainHoldEntry(getEntry(day))) {
     return RAIN_HOLD_TEXT;
@@ -1934,7 +1952,6 @@ function renderBoardList() {
                 : ""
             }
           </span>
-          <button class="board-delete-button" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제">×</button>
         </div>
       `;
     })
@@ -2714,6 +2731,7 @@ async function createNewBoard() {
     pourDate: toDateInputValue(new Date()),
     entries: {},
   };
+  lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
 
   if (dbClient) {
     await loadCloudBoard({ createIfMissing: true });
@@ -2772,125 +2790,6 @@ async function openBoard(shareCode) {
   await loadBoardList();
   if (token !== boardLoadToken || state.shareCode !== shareCode) return;
   renderAll();
-}
-
-async function deleteBoard(shareCode) {
-  if (!shareCode) return;
-  const ok = window.confirm("이 사진대지를 목록에서 삭제할까요?");
-  if (!ok) return;
-
-  const target = boardList.find((board) => board.shareCode === shareCode);
-  boardList = boardList.filter((board) => board.shareCode !== shareCode);
-  renderBoardList();
-
-  if (dbClient) {
-    const { data: board, error } = await dbClient
-      .from("photo_boards")
-      .select("id, photo_entries(photo_path, memo)")
-      .eq("share_code", shareCode)
-      .maybeSingle();
-
-    if (error) {
-      console.error(error);
-      showToast("사진대지 삭제에 실패했습니다.");
-      await loadBoardList();
-      renderBoardList();
-      return;
-    }
-
-    if (board?.id) {
-      const { error: boardError } = await dbClient.from("photo_boards").delete().eq("id", board.id);
-      if (boardError) {
-        console.error(boardError);
-        const hidden = await hideBoardFromList(shareCode);
-        if (!hidden) {
-          showToast("사진대지 삭제에 실패했습니다.");
-          await loadBoardList();
-          renderBoardList();
-          return;
-        }
-      } else {
-        const { data: remains, error: remainsError } = await dbClient
-          .from("photo_boards")
-          .select("id")
-          .eq("share_code", shareCode)
-          .maybeSingle();
-
-        if (remainsError) {
-          console.error(remainsError);
-        }
-
-        if (remains?.id) {
-          const hidden = await hideBoardFromList(shareCode);
-          if (!hidden) {
-            showToast("사진대지를 목록에서 숨기지 못했습니다.");
-            await loadBoardList();
-            renderBoardList();
-            return;
-          }
-        }
-      }
-
-      const paths = collectPhotoStoragePaths(board.photo_entries || []);
-      if (paths.length) {
-        dbClient.storage.from(config.bucket).remove(paths).catch(console.error);
-      }
-    }
-  } else {
-    localStorage.removeItem(LOCAL_PREFIX + shareCode);
-    localStorage.removeItem(META_DRAFT_PREFIX + shareCode);
-  }
-
-  try {
-    localStorage.removeItem(META_DRAFT_PREFIX + shareCode);
-  } catch {
-    // Ignore storage cleanup errors.
-  }
-
-  showToast(`${target?.pourPart || "사진대지"}를 삭제했습니다.`);
-
-  await loadBoardList();
-
-  if (shareCode === state.shareCode) {
-    await openNextBoardAfterDelete();
-    return;
-  }
-
-  renderBoardList();
-  renderStorageMeter();
-}
-
-async function openNextBoardAfterDelete() {
-  const nextBoard = boardList.find((board) => board.shareCode !== state.shareCode);
-  if (nextBoard) {
-    await openBoard(nextBoard.shareCode);
-    return;
-  }
-
-  const url = new URL(window.location.href);
-  url.searchParams.delete("board");
-  window.history.replaceState({}, "", url.toString());
-
-  resetCurrentBoard();
-  renderAll();
-  showToast("삭제했습니다. 새 대지를 누르면 새 사진대지가 만들어집니다.");
-}
-
-async function hideBoardFromList(shareCode) {
-  const { error } = await dbClient
-    .from("photo_boards")
-    .update({
-      pour_date: null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("share_code", shareCode);
-
-  if (error) {
-    console.error(error);
-    return false;
-  }
-
-  return true;
 }
 
 function showToast(message) {

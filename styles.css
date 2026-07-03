@@ -591,10 +591,10 @@ input:focus {
   min-width: 0;
   min-height: 50px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, auto) 24px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, auto);
   grid-template-areas:
-    "date count delete"
-    "part part part";
+    "date count"
+    "part part";
   align-items: start;
   column-gap: 5px;
   row-gap: 1px;
@@ -608,36 +608,14 @@ input:focus {
   font: inherit;
 }
 
-.board-open-button,
-.board-delete-button {
+.board-open-button {
   min-width: 0;
   border: 0;
   background: transparent;
   color: inherit;
   font: inherit;
-}
-
-.board-open-button {
   display: contents;
   text-align: left;
-}
-
-.board-delete-button {
-  grid-area: delete;
-  width: 24px;
-  height: 24px;
-  display: inline-grid;
-  place-items: center;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--danger);
-  cursor: pointer;
-  font-weight: 900;
-}
-
-.board-delete-button:hover {
-  background: #fff0ef;
 }
 
 .board-list-item:hover,
