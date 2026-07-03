@@ -34,6 +34,9 @@ const PHOTO_TYPE_CONFIG = {
 };
 const LOCAL_PREFIX = "curing-photo-board:";
 const META_DRAFT_PREFIX = `${LOCAL_PREFIX}meta-draft:`;
+const SUPABASE_JS_URL = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js";
+const HEIC2ANY_URL = "https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js";
+const JSPDF_URL = "https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js";
 const STORAGE_DISPLAY_LIMIT_BYTES = 1024 * 1024 * 1024;
 const ESTIMATED_PHOTO_BYTES = 450 * 1024;
 const IMAGE_MAX_WIDTH = 1280;
@@ -142,6 +145,7 @@ let boardLoadToken = 0;
 let printPreviewRenderToken = 0;
 let printPreviewTimer = null;
 let activePhotoType = DEFAULT_PHOTO_TYPE;
+let pasteTargetDay = null;
 let printImageCache = {
   signature: "",
   images: [],
@@ -183,6 +187,9 @@ async function init() {
   }
 
   renderAll();
+
+  // 현장 통신이 약할 수 있어, PDF 생성용 라이브러리를 미리 받아둔다. (실패해도 무시)
+  ensureJsPdf().catch(() => {});
 }
 
 function bindEvents() {
@@ -291,6 +298,12 @@ function bindEvents() {
       return;
     }
 
+    const pasteSlot = event.target.closest("[data-paste-day]");
+    if (pasteSlot) {
+      setPasteTarget(Number(pasteSlot.dataset.pasteDay));
+      return;
+    }
+
     const previewButton = event.target.closest("[data-preview-day]");
     if (previewButton) {
       openPhotoViewer(Number(previewButton.dataset.previewDay), previewButton.dataset.previewType);
@@ -318,6 +331,68 @@ function bindEvents() {
   });
   elements.standardDocStage.addEventListener("scroll", handleStandardDocumentScroll, { passive: true });
   document.addEventListener("keydown", handleGlobalKeydown);
+  document.addEventListener("paste", handleClipboardPaste);
+}
+
+function setPasteTarget(day) {
+  if (!day) return;
+  pasteTargetDay = day;
+  elements.dayGrid.querySelectorAll(".empty-photo.paste-armed").forEach((el) => {
+    el.classList.remove("paste-armed");
+  });
+  const slot = elements.dayGrid.querySelector(`[data-paste-day="${day}"]`);
+  if (slot) slot.classList.add("paste-armed");
+  const label = getPhotoSlotLabel(day, activePhotoType);
+  showToast(`${label} 칸이 선택됐어요. 이제 Ctrl+V로 사진을 붙여넣으세요.`);
+}
+
+async function handleClipboardPaste(event) {
+  const items = event.clipboardData && event.clipboardData.items;
+  if (!items) return;
+
+  let file = null;
+  for (const item of items) {
+    if (item.kind === "file" && item.type.startsWith("image/")) {
+      file = item.getAsFile();
+      break;
+    }
+  }
+  if (!file) return;
+
+  event.preventDefault();
+
+  if (!pasteTargetDay) {
+    showToast("먼저 사진을 넣을 일차 칸을 한 번 눌러 선택해 주세요.");
+    return;
+  }
+  if (!state.shareCode || (dbClient && !state.boardId)) {
+    showToast("새 대지를 먼저 만들어 주세요.");
+    return;
+  }
+
+  const day = pasteTargetDay;
+  const photoType = activePhotoType;
+  const pastedFile = normalizePastedImageName(file, day, photoType);
+
+  const ok = await handlePhotoUpload(photoType, day, pastedFile);
+  if (ok) {
+    pasteTargetDay = null;
+    await loadBoardList();
+    renderAll();
+    await flushPendingRealtimeRefresh();
+  }
+}
+
+function normalizePastedImageName(file, day, photoType) {
+  const hasName = file.name && file.name.trim() && file.name !== "image.png";
+  if (hasName) return file;
+  const ext = (file.type && file.type.split("/")[1]) || "png";
+  const safeName = `paste-${normalizePhotoType(photoType)}-day-${day}-${Date.now()}.${ext}`;
+  try {
+    return new File([file], safeName, { type: file.type || "image/png" });
+  } catch {
+    return file;
+  }
 }
 
 function toggleStandardPanel() {
@@ -893,18 +968,12 @@ async function loadBoardList() {
 }
 
 async function loadCloudBoardList() {
-  const range = getListRange();
-  let query = dbClient
+  const { data, error } = await dbClient
     .from("photo_boards")
     .select("id, share_code, project_name, pour_part, pour_date, created_at, updated_at, photo_entries(day_no, photo_url, memo)")
     .not("pour_date", "is", null)
     .order("pour_date", { ascending: false })
     .order("created_at", { ascending: false });
-
-  if (range.start) query = query.gte("pour_date", range.start);
-  if (range.end) query = query.lte("pour_date", range.end);
-
-  const { data, error } = await query;
   if (error) throw error;
 
   boardList = (data || []).map((board) => {
@@ -925,7 +994,6 @@ async function loadCloudBoardList() {
 }
 
 function loadLocalBoardList() {
-  const range = getListRange();
   boardList = Object.keys(localStorage)
     .filter((key) => key.startsWith(LOCAL_PREFIX) && !key.startsWith(META_DRAFT_PREFIX))
     .map((key) => {
@@ -950,12 +1018,7 @@ function loadLocalBoardList() {
       }
     })
     .filter(Boolean)
-    .filter((board) => {
-      if (!board.pourDate) return false;
-      if (range.start && board.pourDate < range.start) return false;
-      if (range.end && board.pourDate > range.end) return false;
-      return true;
-    })
+    .filter((board) => Boolean(board.pourDate))
     .sort((a, b) => {
       const dateCompare = (b.pourDate || "").localeCompare(a.pourDate || "");
       if (dateCompare) return dateCompare;
@@ -980,10 +1043,6 @@ async function reconcileCurrentBoardEntries() {
   } else if (!dbClient) {
     loadLocalBoard();
   }
-}
-
-function getListRange() {
-  return { start: "", end: "" };
 }
 
 function countVisibleBoardPhotos() {
@@ -2102,13 +2161,13 @@ function renderDayGrid() {
             }
             <span class="date-pill">${escapeHtml(slotDateLabel)}</span>
           </div>
-          <div class="photo-preview">
+          <div class="photo-preview" data-photo-slot="${day}">
             ${
               hasPhoto
                 ? `<button class="photo-preview-button" type="button" data-preview-day="${day}" data-preview-type="${escapeAttribute(photoType)}" title="${escapeAttribute(slotLabel)} 사진 크게 보기">
                     <img src="${escapeAttribute(photo.photoUrl)}" alt="${escapeAttribute(slotLabel)} ${escapeAttribute(typeConfig.label)} 사진" loading="lazy" decoding="async">
                   </button>`
-                : `<div class="empty-photo ${rainHold ? "rain-hold" : ""}"><span>${escapeHtml(emptyPhotoText)}</span></div>`
+                : `<button class="empty-photo ${rainHold ? "rain-hold" : ""}" type="button" data-paste-day="${day}" title="여기를 누른 뒤 Ctrl+V로 붙여넣기"><span>${escapeHtml(emptyPhotoText)}</span></button>`
             }
           </div>
           <div class="day-card-body">
@@ -2136,6 +2195,12 @@ function renderDayGrid() {
       `;
     })
     .join("");
+
+  if (pasteTargetDay) {
+    const armed = elements.dayGrid.querySelector(`[data-paste-day="${pasteTargetDay}"]`);
+    if (armed) armed.classList.add("paste-armed");
+    else pasteTargetDay = null;
+  }
 }
 
 function renderPrintArea() {
@@ -2152,7 +2217,7 @@ function renderPrintArea() {
   elements.printArea.innerHTML = `<div class="print-render-loading">출력 미리보기 준비 중</div>`;
   printPreviewTimer = window.setTimeout(async () => {
     try {
-      const images = await getPrintPageImages();
+      const { images } = await getPrintPageImages();
       if (token !== printPreviewRenderToken) return;
       renderPrintPreviewImages(images);
     } catch (error) {
@@ -2254,15 +2319,16 @@ function getPrintPageGroups(photoType = activePhotoType) {
 async function getPrintPageImages() {
   const signature = getPrintImageSignature();
   if (printImageCache.signature === signature && Array.isArray(printImageCache.images)) {
-    return printImageCache.images;
+    return { images: printImageCache.images, failedCount: printImageCache.failedCount || 0 };
   }
 
   const photoType = activePhotoType;
   const groups = getPrintPageGroups(photoType);
   const photos = await loadPrintPhotos(photoType);
+  const failedCount = countPrintPhotoFailures(photos);
   const images = groups.map((group) => createPrintPageImage(group, photos, photoType));
-  printImageCache = { signature, images };
-  return images;
+  printImageCache = { signature, images, failedCount };
+  return { images, failedCount };
 }
 
 async function loadPrintPhotos(photoType = activePhotoType) {
@@ -2271,13 +2337,17 @@ async function loadPrintPhotos(photoType = activePhotoType) {
   const photoPairs = await Promise.all(
     slots.map(async (day) => {
       const photoUrl = getTypedPhoto(getEntry(day), normalizedType).photoUrl;
-      if (!photoUrl) return [day, null];
+      if (!photoUrl) return [day, { image: null, failed: false }];
       const image = await loadPrintPhoto(photoUrl);
-      return [day, image];
+      return [day, { image, failed: !image }];
     })
   );
 
   return Object.fromEntries(photoPairs);
+}
+
+function countPrintPhotoFailures(photos) {
+  return Object.values(photos || {}).filter((info) => info && info.failed).length;
 }
 
 function loadPrintPhoto(src) {
@@ -2401,7 +2471,8 @@ function drawPrintBlockCanvas(ctx, day, x, y, photos, allowPhotos, photoType = a
 
   if (!day) return;
 
-  drawPrintPhoto(ctx, day, x, y, tableW, photoH, photos[day], allowPhotos, photoType);
+  const photoInfo = photos[day] || { image: null, failed: false };
+  drawPrintPhoto(ctx, day, x, y, tableW, photoH, photoInfo, allowPhotos, photoType);
   drawCenteredPrintText(ctx, "위  치", x, infoY, labelW, infoH, 13, "Batang, serif");
   drawPrintMainTextCanvas(ctx, state.pourPart || "", x + labelW, infoY, mainW, infoH, {
     breakAfterFirstBracket: true,
@@ -2421,7 +2492,8 @@ function drawPrintCell(ctx, x, y, width, height) {
   ctx.restore();
 }
 
-function drawPrintPhoto(ctx, day, x, y, width, height, image, allowPhotos, photoType = activePhotoType) {
+function drawPrintPhoto(ctx, day, x, y, width, height, photoInfo, allowPhotos, photoType = activePhotoType) {
+  const info = photoInfo || { image: null, failed: false };
   const photoW = printMm(PRINT_PHOTO_WIDTH_MM);
   const photoH = printMm(PRINT_PHOTO_HEIGHT_MM);
   const photoX = x + (width - photoW) / 2;
@@ -2431,8 +2503,10 @@ function drawPrintPhoto(ctx, day, x, y, width, height, image, allowPhotos, photo
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(photoX, photoY, photoW, photoH);
 
-  if (allowPhotos && image) {
-    drawCoverImage(ctx, image, photoX, photoY, photoW, photoH);
+  if (allowPhotos && info.image) {
+    drawCoverImage(ctx, info.image, photoX, photoY, photoW, photoH);
+  } else if (info.failed) {
+    drawCenteredPrintText(ctx, "사진 불러오기 실패", photoX, photoY, photoW, photoH, 13, "Batang, serif");
   } else {
     drawCenteredPrintText(ctx, getPrintMissingPhotoText(day, photoType), photoX, photoY, photoW, photoH, 13, "Batang, serif");
   }
@@ -2577,53 +2651,85 @@ function fitPrintCanvasText(ctx, text, maxWidth, suffix = "") {
 }
 
 async function handlePrint() {
-  if (isKakaoInAppBrowser()) {
-    showToast("카톡 안에서는 인쇄가 막힐 수 있습니다. 브라우저로 열어서 인쇄해 주세요.");
+  if (!state.shareCode || (dbClient && !state.boardId)) {
+    showToast("먼저 사진대지를 선택하거나 만들어 주세요.");
     return;
   }
 
-  const printWindow = window.open("", "_blank");
-  if (!printWindow) {
-    showToast("새 창이 차단됐습니다. 팝업을 허용한 뒤 PDF를 다시 눌러 주세요.");
-    return;
-  }
-
-  writePrintLoadingDocument(printWindow);
   elements.printButton.disabled = true;
-  showToast("출력 이미지를 준비하는 중입니다.");
+  showToast("출력 파일을 준비하는 중입니다.");
   try {
-    const images = await getPrintPageImages();
+    const { images, failedCount } = await getPrintPageImages();
     if (!images.length) {
-      printWindow.close();
       showToast(`${getPhotoTypeConfig(activePhotoType).sectionTitle}이 없습니다.`);
       return;
     }
-    writeRasterPrintDocument(printWindow, images);
+
+    if (failedCount > 0) {
+      showToast(`사진 ${failedCount}장을 불러오지 못해 '사진 불러오기 실패'로 표시됩니다. 잠시 후 다시 시도해 보세요.`);
+    }
+
+    const saved = await savePrintPdf(images);
+    if (saved) {
+      showToast(failedCount > 0 ? "PDF를 저장했습니다. (일부 사진 로드 실패)" : "PDF를 저장했습니다.");
+      return;
+    }
+
+    // PDF 생성 실패 시(라이브러리 미로딩 등) 기존 인쇄 창 방식으로 폴백
+    openPrintWindowFallback(images);
   } catch (error) {
     console.error(error);
-    printWindow.close();
-    showToast("출력 이미지를 만들지 못했습니다.");
+    showToast("출력 파일을 만들지 못했습니다.");
   } finally {
     elements.printButton.disabled = false;
   }
 }
 
-function writePrintLoadingDocument(printWindow) {
-  printWindow.document.open();
-  printWindow.document.write(`<!doctype html>
-    <html lang="ko">
-      <head>
-        <meta charset="utf-8">
-        <meta name="color-scheme" content="light">
-        <title>PDF 출력 준비</title>
-        <style>
-          html, body { margin: 0; background: #fff; color: #000; color-scheme: light; }
-          body { display: grid; min-height: 100vh; place-items: center; font-family: sans-serif; }
-        </style>
-      </head>
-      <body>출력 이미지를 준비하는 중입니다.</body>
-    </html>`);
-  printWindow.document.close();
+async function savePrintPdf(images) {
+  let jsPdfCtor = null;
+  try {
+    jsPdfCtor = await ensureJsPdf();
+  } catch (error) {
+    console.error("jsPDF 로드 실패", error);
+    return false;
+  }
+  if (!jsPdfCtor) return false;
+
+  try {
+    const pdf = new jsPdfCtor({ orientation: "portrait", unit: "mm", format: "a4" });
+    const pageW = 210;
+    const pageH = 297;
+    images.forEach((src, index) => {
+      if (index > 0) pdf.addPage();
+      pdf.addImage(src, "PNG", 0, 0, pageW, pageH, undefined, "FAST");
+    });
+    pdf.save(buildPdfFilename());
+    return true;
+  } catch (error) {
+    console.error("PDF 생성 실패", error);
+    return false;
+  }
+}
+
+function buildPdfFilename() {
+  const part = (state.pourPart || "사진대지").replace(/[\\/:*?"<>|]/g, "_").trim() || "사진대지";
+  const typeLabel = getPhotoTypeConfig(activePhotoType).label || "";
+  const date = state.pourDate ? `_${state.pourDate}` : "";
+  return `${part}_${typeLabel}${date}.pdf`;
+}
+
+function openPrintWindowFallback(images) {
+  if (isKakaoInAppBrowser()) {
+    showToast("카톡 안에서는 PDF 저장이 막힐 수 있습니다. 오른쪽 위 ··· → 다른 브라우저로 열어 주세요.");
+    return;
+  }
+  const printWindow = window.open("", "_blank");
+  if (!printWindow) {
+    showToast("PDF 저장에 실패했고 새 창도 차단됐습니다. 팝업을 허용한 뒤 다시 눌러 주세요.");
+    return;
+  }
+  writeRasterPrintDocument(printWindow, images);
+  showToast("PDF 저장 대신 인쇄 창을 열었습니다. '대상: PDF로 저장'을 선택하세요.");
 }
 
 function writeRasterPrintDocument(printWindow, images) {
@@ -2842,7 +2948,7 @@ async function prepareImageFile(file) {
 
 async function ensureHeicConverter() {
   if (window.heic2any) return;
-  await loadScript("https://cdn.jsdelivr.net/npm/heic2any/dist/heic2any.min.js");
+  await loadScript(HEIC2ANY_URL);
   if (!window.heic2any) {
     throw new Error("HEIC converter unavailable");
   }
@@ -2992,7 +3098,18 @@ function getStorageDisplayLimitBytes() {
 
 function ensureSupabaseClient() {
   if (window.supabase) return Promise.resolve();
-  return loadScript("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2");
+  return loadScript(SUPABASE_JS_URL);
+}
+
+async function ensureJsPdf() {
+  const getCtor = () => {
+    if (window.jspdf && window.jspdf.jsPDF) return window.jspdf.jsPDF;
+    if (window.jsPDF) return window.jsPDF;
+    return null;
+  };
+  if (getCtor()) return getCtor();
+  await loadScript(JSPDF_URL);
+  return getCtor();
 }
 
 function isKakaoInAppBrowser() {
@@ -3003,7 +3120,11 @@ function loadScript(src) {
   return new Promise((resolve, reject) => {
     const existing = document.querySelector(`script[src="${src}"]`);
     if (existing) {
-      existing.addEventListener("load", resolve, { once: true });
+      if (existing.dataset.loaded === "true") {
+        resolve();
+        return;
+      }
+      existing.addEventListener("load", () => resolve(), { once: true });
       existing.addEventListener("error", reject, { once: true });
       return;
     }
@@ -3011,7 +3132,10 @@ function loadScript(src) {
     const script = document.createElement("script");
     script.src = src;
     script.async = true;
-    script.onload = resolve;
+    script.onload = () => {
+      script.dataset.loaded = "true";
+      resolve();
+    };
     script.onerror = reject;
     document.head.appendChild(script);
   });
@@ -3031,5 +3155,6 @@ function escapeAttribute(value) {
 }
 
 function normalizeProjectName(value) {
-  return String(value || DEFAULT_PROJECT_NAME).replaceAll("(주)서화", "(주)한화");
+  const text = String(value == null ? "" : value).trim();
+  return text || DEFAULT_PROJECT_NAME;
 }
