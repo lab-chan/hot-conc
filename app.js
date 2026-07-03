@@ -129,7 +129,7 @@ const config = window.CONCRETE_PHOTO_CONFIG || {};
 let dbClient = null;
 let realtimeChannel = null;
 let metaSaveTimer = null;
-let lastSyncedMeta = { pourPart: "", pourDate: "" };
+let lastSyncedMeta = { projectName: "", pourPart: "", pourDate: "" };
 let boardList = [];
 let boardSearchQuery = "";
 let boardListRenderFrame = 0;
@@ -747,7 +747,7 @@ function resetCurrentBoard(options = {}) {
     createdAt: "",
     entries: {},
   };
-  lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
+  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
   syncInputsFromState();
 }
 
@@ -785,7 +785,7 @@ function loadLocalBoard() {
   }
 
   applyMetaDraft("");
-  lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
+  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
   syncInputsFromState();
   saveLocalBoard();
 }
@@ -809,6 +809,7 @@ async function loadCloudBoard(options = {}) {
     state.pourPart = board.pour_part || "";
     state.pourDate = board.pour_date || toDateInputValue(new Date());
     state.createdAt = board.created_at || "";
+    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
   } else if (createIfMissing) {
     const { data: created, error: insertError } = await dbClient
       .from("photo_boards")
@@ -829,6 +830,7 @@ async function loadCloudBoard(options = {}) {
     state.pourPart = created.pour_part || "";
     state.pourDate = created.pour_date || toDateInputValue(new Date());
     state.createdAt = created.created_at || "";
+    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
   } else {
     resetCurrentBoard({ keepShareCode: true });
   }
@@ -846,7 +848,6 @@ async function loadCloudBoard(options = {}) {
     syncInputsFromState();
   }
 
-  lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
   return usedDraft;
 }
 
@@ -1103,6 +1104,12 @@ async function saveMeta(options = {}) {
   if (!state.shareCode) return;
   if (dbClient && !state.boardId) return;
 
+  const hasMetaChange =
+    state.projectName !== lastSyncedMeta.projectName ||
+    state.pourPart !== lastSyncedMeta.pourPart ||
+    state.pourDate !== lastSyncedMeta.pourDate;
+  if (!hasMetaChange) return;
+
   if (countPhotoEntries(state.entries || {}) > 0 && metaChangedFromSynced()) {
     if (silent) return;
     const ok = window.confirm(
@@ -1132,14 +1139,14 @@ async function saveMeta(options = {}) {
     }
 
     clearMetaDraft();
-    lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
+    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
     await loadBoardList();
     renderBoardList();
     renderStorageMeter();
   } else {
     saveLocalBoard();
     clearMetaDraft();
-    lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
+    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
     await loadBoardList();
     renderBoardList();
     renderStorageMeter();
@@ -2713,6 +2720,7 @@ async function createNewBoard() {
     return;
   }
 
+  endFilePickNow();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
   boardLoadToken += 1;
@@ -2731,7 +2739,7 @@ async function createNewBoard() {
     pourDate: toDateInputValue(new Date()),
     entries: {},
   };
-  lastSyncedMeta = { pourPart: state.pourPart, pourDate: state.pourDate };
+  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
 
   if (dbClient) {
     await loadCloudBoard({ createIfMissing: true });
@@ -2753,6 +2761,7 @@ async function openBoard(shareCode) {
     return;
   }
 
+  endFilePickNow();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
   activePhotoType = DEFAULT_PHOTO_TYPE;
