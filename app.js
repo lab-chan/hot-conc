@@ -342,8 +342,6 @@ function setPasteTarget(day) {
   });
   const slot = elements.dayGrid.querySelector(`[data-paste-day="${day}"]`);
   if (slot) slot.classList.add("paste-armed");
-  const label = getPhotoSlotLabel(day, activePhotoType);
-  showToast(`${label} 칸이 선택됐어요. 이제 Ctrl+V로 사진을 붙여넣으세요.`);
 }
 
 async function handleClipboardPaste(event) {
@@ -1436,7 +1434,6 @@ async function handlePhotoUpload(photoType, day, file) {
       return false;
     }
     cleanupOldPhotoPath(image.oldPath, image.newPath);
-    showToast(`${slotLabel} ${typeConfig.label} 사진을 등록했습니다. ${formatBytes(file.size)} → ${formatBytes(image.blob.size)}`);
     return true;
   } catch (error) {
     console.error(error);
@@ -1517,7 +1514,6 @@ async function handlePhotoSelection(photoType, startDay, files) {
     const overflowText = getOverflowPhotoText(overflowCount, normalizedType);
     const invalidText = invalidCount > 0 ? ` 이미지가 아닌 파일 ${invalidCount}개는 제외했습니다.` : "";
     const failedText = failed > 0 ? ` 처리 실패 ${failed}장은 건너뛰었습니다.` : "";
-    showToast(`${startLabel}부터 ${typeConfig.label} 사진 ${completed}장 등록했습니다.${failedText}${overflowText}${invalidText}`);
   } catch (error) {
     console.error(error);
     await loadBoardList();
@@ -1614,8 +1610,6 @@ async function deletePhoto(photoType, day) {
     if (dbClient && previousPhoto.photoPath) {
       dbClient.storage.from(config.bucket).remove([previousPhoto.photoPath]).catch(console.error);
     }
-
-    showToast(`${slotLabel} ${typeConfig.label} 사진을 삭제했습니다.`);
   } finally {
     await endPhotoMutation();
   }
@@ -1640,8 +1634,6 @@ async function toggleRainHold(day) {
     showToast(`${day}일차 우천 설정 저장에 실패했습니다.`);
     return;
   }
-
-  showToast(entry.rainHold ? `${day}일차를 우천 대기로 표시했습니다.` : `${day}일차 우천 대기를 해제했습니다.`);
 }
 
 function getEntry(day) {
@@ -2671,7 +2663,8 @@ async function handlePrint() {
 
     const saved = await savePrintPdf(images);
     if (saved) {
-      showToast(failedCount > 0 ? "PDF를 저장했습니다. (일부 사진 로드 실패)" : "PDF를 저장했습니다.");
+      const savedText = isKakaoInAppBrowser() ? "PDF 다운로드를 시작합니다." : "PDF를 저장했습니다.";
+      showToast(failedCount > 0 ? `${savedText} (일부 사진 로드 실패)` : savedText);
       return;
     }
 
@@ -2703,12 +2696,40 @@ async function savePrintPdf(images) {
       if (index > 0) pdf.addPage();
       pdf.addImage(src, "PNG", 0, 0, pageW, pageH, undefined, "FAST");
     });
-    pdf.save(buildPdfFilename());
+
+    const filename = buildPdfFilename();
+
+    if (isKakaoInAppBrowser()) {
+      const blob = pdf.output("blob");
+      return await deliverPdfViaStorage(blob, filename);
+    }
+
+    pdf.save(filename);
     return true;
   } catch (error) {
     console.error("PDF 생성 실패", error);
     return false;
   }
+}
+
+async function deliverPdfViaStorage(blob, filename) {
+  if (!dbClient || !state.shareCode) return false;
+
+  const path = `${state.shareCode}/pdf/${normalizePhotoType(activePhotoType)}.pdf`;
+  const { error: uploadError } = await dbClient.storage
+    .from(config.bucket)
+    .upload(path, blob, { contentType: "application/pdf", upsert: true });
+
+  if (uploadError) {
+    console.error("PDF 업로드 실패", uploadError);
+    return false;
+  }
+
+  const { data } = dbClient.storage.from(config.bucket).getPublicUrl(path, { download: filename });
+  if (!data?.publicUrl) return false;
+
+  window.location.href = data.publicUrl;
+  return true;
 }
 
 function buildPdfFilename() {
