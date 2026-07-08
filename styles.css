@@ -729,10 +729,10 @@ input:focus {
   grid-area: count;
   min-width: 0;
   display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 3px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: flex-start;
+  gap: 4px;
 }
 
 .board-count {
@@ -763,6 +763,27 @@ input:focus {
 .board-count.temperature.complete {
   background: #1f5f9c;
   color: #fff;
+}
+
+.board-list-delete-button {
+  width: 28px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid rgba(180, 58, 51, 0.24);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--danger);
+  padding: 0;
+  font-size: 16px;
+  font-weight: 900;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.board-list-delete-button:hover {
+  border-color: rgba(180, 58, 51, 0.42);
+  background: #fbecea;
 }
 
 .empty-list {
@@ -932,25 +953,46 @@ input:focus {
 body.admin-mode .day-card-header {
   flex-wrap: wrap;
   justify-content: flex-start;
-  row-gap: 4px;
+  row-gap: 6px;
 }
 
 body.admin-mode .day-card-header h3 {
-  flex: 1 1 calc(100% - 74px);
+  flex: 1 1 0;
   order: 1;
 }
 
 body.admin-mode .day-card-header .date-pill {
   order: 2;
-  margin-left: auto;
+  margin-left: 0;
 }
 
-body.admin-mode .day-card-header .rain-toggle {
+body.admin-mode .day-card-header::after {
+  content: "";
+  flex: 0 0 100%;
+  height: 0;
   order: 3;
 }
 
-body.admin-mode .day-card-header .slot-admin-controls {
+body.admin-mode .day-card-header .rain-toggle {
   order: 4;
+  width: auto;
+  height: 30px;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+body.admin-mode .day-card-header .slot-admin-controls {
+  order: 5;
+  flex: 2 1 0;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+body.admin-mode .day-card-header .slot-admin-controls .icon-mini {
+  width: 100%;
+  height: 30px;
 }
 
 .photo-preview {

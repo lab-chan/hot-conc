@@ -4,7 +4,8 @@ const DEFAULT_DAY_SLOT_COUNT = 5;
 const TWO_DAY_SLOT_COUNT = 2;
 const MAX_DAY_SLOT_COUNT = 12;
 const DAY_SLOT_LIST_STORAGE_KEY = "concrete-photo-board-ui:day-slots";
-const DAY_SLOT_BLIND_STORAGE_KEY = "concrete-photo-board-ui:day-slot-blind";
+const DAY_SLOT_EXTRA_HIDDEN_STORAGE_KEY = "concrete-photo-board-ui:day-slot-extra-hidden";
+const PRINT_DAY_LABEL_BLIND_STORAGE_KEY = "concrete-photo-board-ui:print-day-label-blind";
 const DAY_SLOT_LABELS_STORAGE_KEY = "concrete-photo-board-ui:day-slot-labels";
 const PHOTO_TYPES = {
   CURING: "curing",
@@ -113,7 +114,6 @@ const elements = {
   searchButton: document.getElementById("searchButton"),
   printButton: document.getElementById("printButton"),
   newBoardButton: document.getElementById("newBoardButton"),
-  deleteBoardButton: document.getElementById("deleteBoardButton"),
   setTwoDayAllButton: document.getElementById("setTwoDayAllButton"),
   dayBlindButton: document.getElementById("dayBlindButton"),
   boardSearchBar: document.getElementById("boardSearchBar"),
@@ -243,7 +243,6 @@ function bindEvents() {
   elements.boardListExpandButton?.addEventListener("click", toggleBoardListExpanded);
   elements.printButton.addEventListener("click", handlePrint);
   elements.newBoardButton.addEventListener("click", createNewBoard);
-  elements.deleteBoardButton?.addEventListener("click", deleteCurrentBoard);
   elements.setTwoDayAllButton?.addEventListener("click", setAllBoardsToTwoDaySlots);
   elements.dayBlindButton?.addEventListener("click", toggleDaySlotBlindMode);
   elements.prevPourDateButton.addEventListener("click", () => shiftPourDate(-1));
@@ -266,6 +265,14 @@ function bindEvents() {
     }
   });
   elements.boardList.addEventListener("click", (event) => {
+    const deleteButton = event.target.closest("[data-delete-board-code]");
+    if (deleteButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      deleteBoardByShareCode(deleteButton.dataset.deleteBoardCode).catch(console.error);
+      return;
+    }
+
     const button = event.target.closest("[data-board-code]");
     if (!button) return;
     openBoard(button.dataset.boardCode);
@@ -1859,17 +1866,33 @@ function saveDaySlotList(list) {
   return finalList;
 }
 
-function loadDaySlotBlindMode() {
+function loadExtraDaySlotHiddenMode() {
   try {
-    return localStorage.getItem(DAY_SLOT_BLIND_STORAGE_KEY) === "1";
+    return localStorage.getItem(DAY_SLOT_EXTRA_HIDDEN_STORAGE_KEY) === "1";
   } catch {
     return false;
   }
 }
 
-function saveDaySlotBlindMode(enabled) {
+function saveExtraDaySlotHiddenMode(enabled) {
   try {
-    localStorage.setItem(DAY_SLOT_BLIND_STORAGE_KEY, enabled ? "1" : "0");
+    localStorage.setItem(DAY_SLOT_EXTRA_HIDDEN_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    // 무시
+  }
+}
+
+function loadPrintDayLabelBlindMode() {
+  try {
+    return localStorage.getItem(PRINT_DAY_LABEL_BLIND_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function savePrintDayLabelBlindMode(enabled) {
+  try {
+    localStorage.setItem(PRINT_DAY_LABEL_BLIND_STORAGE_KEY, enabled ? "1" : "0");
   } catch {
     // 무시
   }
@@ -1878,16 +1901,11 @@ function saveDaySlotBlindMode(enabled) {
 function renderDaySlotBlindButton() {
   if (!elements.dayBlindButton) return;
 
-  const enabled = loadDaySlotBlindMode();
+  const enabled = loadPrintDayLabelBlindMode();
   elements.dayBlindButton.setAttribute("aria-pressed", String(enabled));
   elements.dayBlindButton.classList.toggle("active", enabled);
-  elements.dayBlindButton.title = enabled ? "숨긴 일차를 다시 표시" : "설정 밖 일차를 한 번에 숨김";
-
-  const label = elements.dayBlindButton.querySelector(".button-label");
-  if (label) {
-    label.textContent = enabled ? "블라인드 해제" : "일차 블라인드";
-  }
-  elements.dayBlindButton.setAttribute("aria-label", enabled ? "일차 블라인드 해제" : "일차 블라인드");
+  elements.dayBlindButton.title = enabled ? "인쇄 일차 표시" : "인쇄 일차 블라인드";
+  elements.dayBlindButton.setAttribute("aria-label", enabled ? "인쇄 일차 표시" : "인쇄 일차 블라인드");
 }
 
 function setAllBoardsToTwoDaySlots() {
@@ -1899,7 +1917,7 @@ function setAllBoardsToTwoDaySlots() {
   if (!ok) return;
 
   saveDaySlotList(Array.from({ length: TWO_DAY_SLOT_COUNT }, (_, index) => index + 1));
-  saveDaySlotBlindMode(true);
+  saveExtraDaySlotHiddenMode(true);
   pasteTargetDay = null;
   renderAll();
   showToast("모든 타설부위를 2일차 기준으로 표시합니다.");
@@ -1908,11 +1926,11 @@ function setAllBoardsToTwoDaySlots() {
 function toggleDaySlotBlindMode() {
   if (!isAdminMode) return;
 
-  const enabled = !loadDaySlotBlindMode();
-  saveDaySlotBlindMode(enabled);
-  pasteTargetDay = null;
+  const enabled = !loadPrintDayLabelBlindMode();
+  savePrintDayLabelBlindMode(enabled);
+  printImageCache = { signature: "", images: [] };
   renderAll();
-  showToast(enabled ? "설정 밖 일차를 한 번에 가렸습니다." : "숨긴 일차를 다시 표시합니다.");
+  showToast(enabled ? "인쇄 표의 일차 문구를 가렸습니다." : "인쇄 표의 일차 문구를 표시합니다.");
 }
 
 function getEntryItems(entries) {
@@ -1945,7 +1963,7 @@ function hasDaySlotData(entry) {
 // 실제 표시 일차 = 설정된 슬롯 ∪ 이미 사진/데이터가 있는 일차(블라인드가 꺼져 있을 때만 하위 호환 표시).
 function getDaySlotList(entries = state.entries) {
   const set = new Set(getStoredDaySlotList());
-  if (!loadDaySlotBlindMode()) {
+  if (!loadExtraDaySlotHiddenMode()) {
     getEntryItems(entries).forEach(({ entry, dayNo }) => {
       if (!dayNo || !entry || !hasDaySlotData(entry)) return;
       set.add(dayNo);
@@ -2403,6 +2421,11 @@ function renderBoardList() {
                 ? `<span class="board-count temperature">${temperatureCount}장 측정</span>`
                 : ""
             }
+            ${
+              isAdminMode
+                ? `<button class="board-list-delete-button admin-only" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제" aria-label="${escapeAttribute(board.pourPart)} 사진대지 삭제">×</button>`
+                : ""
+            }
           </span>
         </div>
       `;
@@ -2727,6 +2750,7 @@ function getPrintImageSignature() {
     pourDate: state.pourDate || "",
     printSlots,
     entries,
+    printDayLabelBlind: loadPrintDayLabelBlindMode(),
   });
 }
 
@@ -2911,7 +2935,9 @@ function drawPrintBlockCanvas(ctx, day, x, y, photos, allowPhotos, photoType = a
   drawPrintMainTextCanvas(ctx, state.pourPart || "", x + labelW, infoY, mainW, infoH, {
     breakAfterFirstBracket: true,
   });
-  drawCenteredPrintText(ctx, getPhotoSlotLabel(day, photoType), x + labelW + mainW, infoY, dayW, infoH, 13, "Batang, serif");
+  if (!loadPrintDayLabelBlindMode()) {
+    drawCenteredPrintText(ctx, getPhotoSlotLabel(day, photoType), x + labelW + mainW, infoY, dayW, infoH, 13, "Batang, serif");
+  }
   drawCenteredPrintText(ctx, "내  용", x, contentY, labelW, contentH, 13, "Batang, serif");
   drawPrintMainTextCanvas(ctx, getPhotoTypeConfig(photoType).contentText, x + labelW, contentY, mainW + dayW, contentH);
 }
@@ -3324,23 +3350,35 @@ async function createNewBoard() {
 }
 
 async function deleteCurrentBoard() {
+  await deleteBoardByShareCode(state.shareCode);
+}
+
+async function deleteBoardByShareCode(shareCode) {
   if (!isAdminMode) {
-    showToast("관리자 모드에서만 타설부위를 삭제할 수 있습니다.");
+    showToast("관리자 모드에서만 사진대지를 삭제할 수 있습니다.");
     return;
   }
-  if (!state.shareCode || (dbClient && !state.boardId)) {
-    showToast("삭제할 타설부위가 없습니다.");
+  if (!shareCode) {
+    showToast("삭제할 사진대지가 없습니다.");
     return;
   }
   if (activePhotoMutationCount > 0) {
-    showToast("사진 등록이 끝난 뒤 타설부위를 삭제해 주세요.");
+    showToast("사진 등록이 끝난 뒤 사진대지를 삭제해 주세요.");
     return;
   }
 
-  const photoCount = countPhotoEntries(state.entries || {});
-  const pourPart = state.pourPart || "미입력";
+  const target = await loadBoardDeleteTarget(shareCode);
+  if (!target) {
+    showToast("삭제할 사진대지를 찾지 못했습니다.");
+    await loadBoardList();
+    renderBoardList();
+    return;
+  }
+
+  const photoCount = countPhotoEntries(target.entries || {});
+  const pourPart = target.pourPart || "미입력";
   const confirmed = await confirmDangerousAction({
-    title: "타설부위 삭제",
+    title: "사진대지 삭제",
     message:
       photoCount > 0
         ? `${pourPart} 사진대지와 등록된 사진 ${photoCount}장이 함께 삭제됩니다. 되돌릴 수 없습니다.`
@@ -3354,55 +3392,148 @@ async function deleteCurrentBoard() {
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
 
-  const deletedShareCode = state.shareCode;
-  const deletedBoardId = state.boardId;
+  const deletedShareCode = shareCode;
+  const deletingCurrent = state.shareCode === deletedShareCode;
   const nextShareCode = boardList.find((board) => board.shareCode !== deletedShareCode)?.shareCode || "";
-  const photoPaths = collectBoardPhotoPaths(state.entries || {});
 
   try {
-    if (dbClient && deletedBoardId) {
-      if (realtimeChannel) {
+    if (target.boardId && dbClient) {
+      if (deletingCurrent && realtimeChannel) {
         await dbClient.removeChannel(realtimeChannel);
         realtimeChannel = null;
       }
 
-      const { error: entryError } = await dbClient
-        .from("photo_entries")
-        .delete()
-        .eq("board_id", deletedBoardId);
-      if (entryError) throw entryError;
-
-      const { error: boardError } = await dbClient
-        .from("photo_boards")
-        .delete()
-        .eq("id", deletedBoardId);
-      if (boardError) throw boardError;
-
-      await removeBoardStoragePaths(photoPaths);
+      await deleteCloudBoardTarget(target);
     } else {
       localStorage.removeItem(LOCAL_PREFIX + deletedShareCode);
     }
     localStorage.removeItem(META_DRAFT_PREFIX + deletedShareCode);
   } catch (error) {
     console.error(error);
-    showToast("타설부위 삭제에 실패했습니다.");
+    showToast("사진대지 삭제에 실패했습니다.");
     return;
   }
 
-  state.shareCode = "";
-  state.boardId = null;
   await loadBoardList();
 
-  if (nextShareCode && boardList.some((board) => board.shareCode === nextShareCode)) {
-    await openBoard(nextShareCode);
+  if (deletingCurrent) {
+    state.shareCode = "";
+    state.boardId = null;
+
+    if (nextShareCode && boardList.some((board) => board.shareCode === nextShareCode)) {
+      await openBoard(nextShareCode);
+    } else {
+      resetCurrentBoard();
+      syncUrlToCurrentBoard();
+      await loadBoardList();
+      renderAll();
+    }
   } else {
-    resetCurrentBoard();
-    syncUrlToCurrentBoard();
-    await loadBoardList();
     renderAll();
   }
 
-  showToast("타설부위를 삭제했습니다.");
+  showToast("사진대지를 삭제했습니다.");
+}
+
+async function loadBoardDeleteTarget(shareCode) {
+  if (!shareCode) return null;
+
+  if (!dbClient) {
+    if (shareCode === state.shareCode) {
+      return {
+        shareCode,
+        boardId: null,
+        pourPart: state.pourPart || "",
+        entries: normalizeEntries(state.entries || {}),
+      };
+    }
+
+    const saved = localStorage.getItem(LOCAL_PREFIX + shareCode);
+    if (!saved) return null;
+
+    try {
+      const parsed = JSON.parse(saved);
+      return {
+        shareCode,
+        boardId: null,
+        pourPart: parsed.pourPart || "",
+        entries: normalizeEntries(parsed.entries || {}),
+      };
+    } catch (error) {
+      console.warn("Local board delete target parse failed", error);
+      return null;
+    }
+  }
+
+  if (shareCode === state.shareCode && state.boardId) {
+    return {
+      shareCode,
+      boardId: state.boardId,
+      pourPart: state.pourPart || "",
+      entries: normalizeEntries(state.entries || {}),
+    };
+  }
+
+  const { data, error } = await dbClient
+    .from("photo_boards")
+    .select("id, share_code, pour_part, photo_entries(*)")
+    .eq("share_code", shareCode)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+
+  const entries = {};
+  (data.photo_entries || []).forEach((row) => {
+    const memo = parseEntryMemo(row.memo);
+    entries[row.day_no] = {
+      dayNo: row.day_no,
+      photoUrl: row.photo_url || "",
+      photoPath: row.photo_path || "",
+      uploadedAt: row.uploaded_at || "",
+      rainHold: memo.rainHold,
+      photos: memo.photos || {},
+    };
+  });
+
+  return {
+    shareCode,
+    boardId: data.id,
+    pourPart: data.pour_part || "",
+    entries: normalizeEntries(entries),
+  };
+}
+
+async function deleteCloudBoardTarget(target) {
+  if (!dbClient || !target?.boardId) return false;
+
+  const photoPaths = collectBoardPhotoPaths(target.entries || {});
+  let hardDeleted = false;
+
+  const { error: entryError } = await dbClient
+    .from("photo_entries")
+    .delete()
+    .eq("board_id", target.boardId);
+
+  if (!entryError) {
+    const { error: boardError } = await dbClient
+      .from("photo_boards")
+      .delete()
+      .eq("id", target.boardId);
+    hardDeleted = !boardError;
+  }
+
+  if (hardDeleted) {
+    await removeBoardStoragePaths(photoPaths);
+    return true;
+  }
+
+  const { error: archiveError } = await dbClient
+    .from("photo_boards")
+    .update({ pour_date: null, updated_at: new Date().toISOString() })
+    .eq("id", target.boardId);
+  if (archiveError) throw archiveError;
+
+  return true;
 }
 
 function collectBoardPhotoPaths(entries) {
