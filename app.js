@@ -113,6 +113,7 @@ const elements = {
   searchButton: document.getElementById("searchButton"),
   printButton: document.getElementById("printButton"),
   newBoardButton: document.getElementById("newBoardButton"),
+  deleteBoardButton: document.getElementById("deleteBoardButton"),
   setTwoDayAllButton: document.getElementById("setTwoDayAllButton"),
   dayBlindButton: document.getElementById("dayBlindButton"),
   boardSearchBar: document.getElementById("boardSearchBar"),
@@ -242,6 +243,7 @@ function bindEvents() {
   elements.boardListExpandButton?.addEventListener("click", toggleBoardListExpanded);
   elements.printButton.addEventListener("click", handlePrint);
   elements.newBoardButton.addEventListener("click", createNewBoard);
+  elements.deleteBoardButton?.addEventListener("click", deleteCurrentBoard);
   elements.setTwoDayAllButton?.addEventListener("click", setAllBoardsToTwoDaySlots);
   elements.dayBlindButton?.addEventListener("click", toggleDaySlotBlindMode);
   elements.prevPourDateButton.addEventListener("click", () => shiftPourDate(-1));
@@ -1885,6 +1887,7 @@ function renderDaySlotBlindButton() {
   if (label) {
     label.textContent = enabled ? "블라인드 해제" : "일차 블라인드";
   }
+  elements.dayBlindButton.setAttribute("aria-label", enabled ? "일차 블라인드 해제" : "일차 블라인드");
 }
 
 function setAllBoardsToTwoDaySlots() {
@@ -3318,6 +3321,107 @@ async function createNewBoard() {
   await loadBoardList();
   renderAll();
   showToast("새 사진대지를 만들었습니다.");
+}
+
+async function deleteCurrentBoard() {
+  if (!isAdminMode) {
+    showToast("관리자 모드에서만 타설부위를 삭제할 수 있습니다.");
+    return;
+  }
+  if (!state.shareCode || (dbClient && !state.boardId)) {
+    showToast("삭제할 타설부위가 없습니다.");
+    return;
+  }
+  if (activePhotoMutationCount > 0) {
+    showToast("사진 등록이 끝난 뒤 타설부위를 삭제해 주세요.");
+    return;
+  }
+
+  const photoCount = countPhotoEntries(state.entries || {});
+  const pourPart = state.pourPart || "미입력";
+  const confirmed = await confirmDangerousAction({
+    title: "타설부위 삭제",
+    message:
+      photoCount > 0
+        ? `${pourPart} 사진대지와 등록된 사진 ${photoCount}장이 함께 삭제됩니다. 되돌릴 수 없습니다.`
+        : `${pourPart} 사진대지를 삭제합니다.`,
+    confirmLabel: "삭제",
+    countdownSeconds: photoCount > 0 ? 3 : 0,
+  });
+  if (!confirmed) return;
+
+  endFilePickNow();
+  window.clearTimeout(metaSaveTimer);
+  metaSaveTimer = null;
+
+  const deletedShareCode = state.shareCode;
+  const deletedBoardId = state.boardId;
+  const nextShareCode = boardList.find((board) => board.shareCode !== deletedShareCode)?.shareCode || "";
+  const photoPaths = collectBoardPhotoPaths(state.entries || {});
+
+  try {
+    if (dbClient && deletedBoardId) {
+      if (realtimeChannel) {
+        await dbClient.removeChannel(realtimeChannel);
+        realtimeChannel = null;
+      }
+
+      const { error: entryError } = await dbClient
+        .from("photo_entries")
+        .delete()
+        .eq("board_id", deletedBoardId);
+      if (entryError) throw entryError;
+
+      const { error: boardError } = await dbClient
+        .from("photo_boards")
+        .delete()
+        .eq("id", deletedBoardId);
+      if (boardError) throw boardError;
+
+      await removeBoardStoragePaths(photoPaths);
+    } else {
+      localStorage.removeItem(LOCAL_PREFIX + deletedShareCode);
+    }
+    localStorage.removeItem(META_DRAFT_PREFIX + deletedShareCode);
+  } catch (error) {
+    console.error(error);
+    showToast("타설부위 삭제에 실패했습니다.");
+    return;
+  }
+
+  state.shareCode = "";
+  state.boardId = null;
+  await loadBoardList();
+
+  if (nextShareCode && boardList.some((board) => board.shareCode === nextShareCode)) {
+    await openBoard(nextShareCode);
+  } else {
+    resetCurrentBoard();
+    syncUrlToCurrentBoard();
+    await loadBoardList();
+    renderAll();
+  }
+
+  showToast("타설부위를 삭제했습니다.");
+}
+
+function collectBoardPhotoPaths(entries) {
+  const paths = new Set();
+  getEntryItems(entries).forEach(({ entry }) => {
+    Object.values(PHOTO_TYPES).forEach((photoType) => {
+      const photo = getTypedPhoto(entry, photoType);
+      if (photo.photoPath) paths.add(photo.photoPath);
+    });
+  });
+  return Array.from(paths);
+}
+
+async function removeBoardStoragePaths(paths) {
+  if (!dbClient || !paths.length) return;
+  const { error } = await dbClient.storage.from(config.bucket).remove(paths);
+  if (error) {
+    console.warn("Board photo storage cleanup failed", error);
+  }
 }
 
 async function openBoard(shareCode) {
