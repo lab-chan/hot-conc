@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light">
     <meta name="darkreader-lock">
     <title>서중 콘크리트 습윤양생 사진대지</title>
-    <link rel="stylesheet" href="./styles.css?v=20260703-7">
+    <link rel="stylesheet" href="./styles.css?v=20260708-5">
     <script src="./config.js"></script>
   </head>
   <body>
@@ -71,11 +71,14 @@
       </section>
 
       <main class="layout">
-        <section class="board-list-section" aria-label="사진대지 목록">
+        <section id="boardListSection" class="board-list-section" aria-label="사진대지 목록">
           <div class="panel-heading">
             <div>
               <h2>사진대지 목록</h2>
             </div>
+            <button id="boardListExpandButton" class="small-button board-list-expand-button" type="button" aria-expanded="false" aria-label="사진대지 목록 펼치기" title="사진대지 목록 펼치기">
+              <span class="button-icon" aria-hidden="true">▾</span>
+            </button>
             <div class="list-tools">
               <div id="storageMeter" class="storage-meter" aria-label="저장 용량">
                 <div class="storage-meter-row">
@@ -143,13 +146,25 @@
             <div>
               <h2 id="photoSectionTitle">습윤양생 사진</h2>
             </div>
-            <div id="photoTypeTabs" class="photo-type-tabs" role="tablist" aria-label="사진 종류 선택">
-              <button class="photo-type-tab temperature-stealth-tab" type="button" data-photo-type="temperature" role="tab" aria-selected="false" title="온도측정 사진">
-                온도측정
-              </button>
-              <button class="photo-type-tab" type="button" data-photo-type="curing" role="tab" aria-selected="true" title="습윤양생 사진">
-                습윤양생
-              </button>
+            <div class="day-section-actions">
+              <div class="admin-day-tools admin-only" aria-label="관리자 일차 설정">
+                <button id="setTwoDayAllButton" class="small-button admin-tool-button" type="button" title="모든 타설부위를 1·2일차만 표시">
+                  <span class="button-icon" aria-hidden="true">2</span>
+                  <span>전체 2일차</span>
+                </button>
+                <button id="dayBlindButton" class="small-button admin-tool-button" type="button" aria-pressed="false" title="설정 밖 일차를 한 번에 숨김">
+                  <span class="button-icon" aria-hidden="true">◩</span>
+                  <span class="button-label">일차 블라인드</span>
+                </button>
+              </div>
+              <div id="photoTypeTabs" class="photo-type-tabs" role="tablist" aria-label="사진 종류 선택">
+                <button class="photo-type-tab temperature-stealth-tab" type="button" data-photo-type="temperature" role="tab" aria-selected="false" title="온도측정 사진">
+                  온도측정
+                </button>
+                <button class="photo-type-tab" type="button" data-photo-type="curing" role="tab" aria-selected="true" title="습윤양생 사진">
+                  습윤양생
+                </button>
+              </div>
             </div>
           </div>
           <div id="dayGrid" class="day-grid"></div>
@@ -201,6 +216,6 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
     <script src="./standards/search-index.js?v=20260703-2"></script>
-    <script src="./app.js?v=20260703-10"></script>
+    <script src="./app.js?v=20260708-5"></script>
   </body>
 </html>

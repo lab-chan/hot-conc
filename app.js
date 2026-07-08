@@ -1,5 +1,11 @@
 const DEFAULT_PROJECT_NAME = "세종천안 2공구 (주)한화";
-const DAY_COUNT = 5;
+// 일차 슬롯: 일반 모드는 기존처럼 기본 5개. 관리자 모드에서 전체 2일차 표시나 추가/삭제/이름변경을 조정합니다.
+const DEFAULT_DAY_SLOT_COUNT = 5;
+const TWO_DAY_SLOT_COUNT = 2;
+const MAX_DAY_SLOT_COUNT = 12;
+const DAY_SLOT_LIST_STORAGE_KEY = "concrete-photo-board-ui:day-slots";
+const DAY_SLOT_BLIND_STORAGE_KEY = "concrete-photo-board-ui:day-slot-blind";
+const DAY_SLOT_LABELS_STORAGE_KEY = "concrete-photo-board-ui:day-slot-labels";
 const PHOTO_TYPES = {
   CURING: "curing",
   TEMPERATURE: "temperature",
@@ -7,9 +13,11 @@ const PHOTO_TYPES = {
 const PHOTO_MISSING_TEXT = "사진 미등록";
 const RAIN_HOLD_TEXT = "우천으로 인한 양생 대기";
 const DEFAULT_PHOTO_TYPE = PHOTO_TYPES.CURING;
-const TEMPERATURE_VISIBILITY_STORAGE_KEY = "concrete-photo-board-ui:temperature-visible";
-const TEMPERATURE_SHOW_CODE = "표시";
-const TEMPERATURE_HIDE_CODE = "숨김";
+// 관리자 모드: 검색창에 "관리자" 입력 시 토글. 온도측정 탭·등록정보 표시·파괴적 작업(삭제/타설일 변경)을 관리자 모드로 통합합니다.
+const ADMIN_MODE_STORAGE_KEY = "concrete-photo-board-ui:admin";
+const ADMIN_TOGGLE_CODE = "관리자";
+// 구 버전 "온도 표시/숨김"(표시·숨김) 개인 설정 키 — init에서 정리 후 관리자 모드로 흡수합니다.
+const LEGACY_TEMPERATURE_VISIBILITY_STORAGE_KEY = "concrete-photo-board-ui:temperature-visible";
 const PHOTO_TYPE_CONFIG = {
   [PHOTO_TYPES.CURING]: {
     label: "습윤양생",
@@ -42,7 +50,7 @@ const ESTIMATED_PHOTO_BYTES = 450 * 1024;
 const IMAGE_MAX_WIDTH = 1280;
 const IMAGE_MAX_HEIGHT = 853;
 const IMAGE_QUALITY = 0.7;
-const PRINT_PAGE_GROUPS = [[1, 2], [3, 4], [5, null]];
+const PRINT_PAGE_GROUP_SIZE = 2; // 사진대지 1페이지당 일차 수(2일차 = 사진 2장). 일차 수에 맞춰 페이지가 자동 증감합니다.
 const PRINT_MM_SCALE = 6;
 const PRINT_PAGE_WIDTH_MM = 210;
 const PRINT_PAGE_HEIGHT_MM = 297;
@@ -105,11 +113,15 @@ const elements = {
   searchButton: document.getElementById("searchButton"),
   printButton: document.getElementById("printButton"),
   newBoardButton: document.getElementById("newBoardButton"),
+  setTwoDayAllButton: document.getElementById("setTwoDayAllButton"),
+  dayBlindButton: document.getElementById("dayBlindButton"),
   boardSearchBar: document.getElementById("boardSearchBar"),
   boardSearchInput: document.getElementById("boardSearchInput"),
   clearSearchButton: document.getElementById("clearSearchButton"),
   storageMeterText: document.getElementById("storageMeterText"),
   storageMeterBar: document.getElementById("storageMeterBar"),
+  boardListSection: document.getElementById("boardListSection"),
+  boardListExpandButton: document.getElementById("boardListExpandButton"),
   boardList: document.getElementById("boardList"),
   projectNameInput: document.getElementById("projectNameInput"),
   pourPartInput: document.getElementById("pourPartInput"),
@@ -150,7 +162,7 @@ let printImageCache = {
   signature: "",
   images: [],
 };
-let isTemperatureAccessVisible = loadTemperatureAccessVisible();
+let isAdminMode = loadAdminMode();
 let activeStandardDocumentKey = "";
 let activeStandardDocumentPage = 1;
 let standardDocumentZoom = 1;
@@ -172,6 +184,8 @@ document.addEventListener("DOMContentLoaded", init);
 async function init() {
   state.shareCode = ensureShareCode();
   bindEvents();
+  cleanupLegacyPreferences();
+  applyAdminModeUi();
   setSyncStatus("저장소를 확인하는 중입니다.");
 
   if (canUseCloud()) {
@@ -207,14 +221,29 @@ function bindEvents() {
     if (isBoardSearchComposing) return;
     handleBoardSearchInput();
   });
+  elements.boardSearchInput.addEventListener("keyup", () => {
+    if (isBoardSearchComposing) return;
+    handleBoardSearchInput();
+  });
+  elements.boardSearchInput.addEventListener("change", handleBoardSearchInput);
   elements.boardSearchInput.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       clearBoardSearch();
+      return;
+    }
+    if (event.key === "Enter" && applyAdminCode(elements.boardSearchInput.value)) {
+      event.preventDefault();
     }
   });
+  elements.boardSearchInput.addEventListener("paste", () => {
+    window.setTimeout(handleBoardSearchInput, 0);
+  });
   elements.clearSearchButton.addEventListener("click", clearBoardSearch);
+  elements.boardListExpandButton?.addEventListener("click", toggleBoardListExpanded);
   elements.printButton.addEventListener("click", handlePrint);
   elements.newBoardButton.addEventListener("click", createNewBoard);
+  elements.setTwoDayAllButton?.addEventListener("click", setAllBoardsToTwoDaySlots);
+  elements.dayBlindButton?.addEventListener("click", toggleDaySlotBlindMode);
   elements.prevPourDateButton.addEventListener("click", () => shiftPourDate(-1));
   elements.nextPourDateButton.addEventListener("click", () => shiftPourDate(1));
   elements.photoTypeTabs?.addEventListener("click", (event) => {
@@ -307,6 +336,24 @@ function bindEvents() {
     const previewButton = event.target.closest("[data-preview-day]");
     if (previewButton) {
       openPhotoViewer(Number(previewButton.dataset.previewDay), previewButton.dataset.previewType);
+      return;
+    }
+
+    const addSlotButton = event.target.closest("[data-add-slot]");
+    if (addSlotButton) {
+      addDaySlot();
+      return;
+    }
+
+    const renameButton = event.target.closest("[data-rename-day]");
+    if (renameButton) {
+      renameDaySlot(Number(renameButton.dataset.renameDay));
+      return;
+    }
+
+    const removeButton = event.target.closest("[data-remove-day]");
+    if (removeButton) {
+      await removeDaySlot(Number(removeButton.dataset.removeDay));
       return;
     }
 
@@ -976,6 +1023,7 @@ async function loadCloudBoardList() {
 
   boardList = (data || []).map((board) => {
     const pourPart = board.pour_part || "미입력";
+    const entries = board.photo_entries || [];
     return {
       shareCode: board.share_code,
       projectName: normalizeProjectName(board.project_name || DEFAULT_PROJECT_NAME),
@@ -984,9 +1032,10 @@ async function loadCloudBoardList() {
       pourDate: board.pour_date || "",
       createdAt: board.created_at || "",
       updatedAt: board.updated_at || "",
-      completedCount: countCompletedEntries(board.photo_entries || [], PHOTO_TYPES.CURING),
-      temperatureCount: countCompletedEntries(board.photo_entries || [], PHOTO_TYPES.TEMPERATURE),
-      photoCount: countPhotoEntries(board.photo_entries || []),
+      entries,
+      completedCount: countCompletedEntries(entries, PHOTO_TYPES.CURING),
+      temperatureCount: countCompletedEntries(entries, PHOTO_TYPES.TEMPERATURE),
+      photoCount: countPhotoEntries(entries),
     };
   });
 }
@@ -1007,6 +1056,7 @@ function loadLocalBoardList() {
           pourDate: parsed.pourDate || "",
           createdAt: parsed.createdAt || parsed.updatedAt || "",
           updatedAt: parsed.updatedAt || "",
+          entries,
           completedCount: countCompletedEntries(entries, PHOTO_TYPES.CURING),
           temperatureCount: countCompletedEntries(entries, PHOTO_TYPES.TEMPERATURE),
           photoCount: countPhotoEntries(entries),
@@ -1583,15 +1633,22 @@ function cleanupNewPhotoPath(newPath) {
   }
 }
 
-async function deletePhoto(photoType, day) {
+async function deletePhoto(photoType, day, { skipConfirm = false } = {}) {
   const normalizedType = normalizePhotoType(photoType);
   const typeConfig = getPhotoTypeConfig(normalizedType);
   const slotLabel = getPhotoSlotLabel(day, normalizedType);
   const entry = getEntry(day);
   const previousPhoto = getTypedPhoto(entry, normalizedType);
   if (!previousPhoto.photoUrl) return;
-  const ok = window.confirm(`${slotLabel} ${typeConfig.label} 사진을 삭제할까요?`);
-  if (!ok) return;
+  // 사진 삭제는 관리자 전용(내부 호출은 skipConfirm으로 통과).
+  if (!isAdminMode && !skipConfirm) {
+    showToast("관리자 모드에서만 사진을 삭제할 수 있습니다.");
+    return;
+  }
+  if (!skipConfirm) {
+    const ok = window.confirm(`${slotLabel} ${typeConfig.label} 사진을 삭제할까요?`);
+    if (!ok) return;
+  }
 
   endFilePickNow();
   beginPhotoMutation();
@@ -1661,7 +1718,13 @@ function getPhotoTypeConfig(photoType = activePhotoType) {
 }
 
 function getPhotoSlotLabel(slot, photoType = activePhotoType) {
-  const config = getPhotoTypeConfig(photoType);
+  const normalizedType = normalizePhotoType(photoType);
+  // 습윤양생 일차는 관리자가 지정한 사용자 이름을 우선 사용(없으면 "N일차").
+  if (normalizedType === PHOTO_TYPES.CURING) {
+    const custom = getDaySlotCustomLabel(slot);
+    if (custom) return custom;
+  }
+  const config = getPhotoTypeConfig(normalizedType);
   return config.slotLabel ? config.slotLabel(slot) : `${slot}일차`;
 }
 
@@ -1680,11 +1743,15 @@ function getOverflowPhotoText(count, photoType = activePhotoType) {
   if (normalizePhotoType(photoType) === PHOTO_TYPES.TEMPERATURE) {
     return ` ${count}장은 등록 가능한 측정 칸을 넘어 제외했습니다.`;
   }
-  return ` ${count}장은 5일차를 넘어 제외했습니다.`;
+  return ` ${count}장은 등록 가능한 일차 칸을 넘어 제외했습니다.`;
 }
 
 function setActivePhotoType(photoType) {
   const nextType = normalizePhotoType(photoType);
+  // 온도측정 탭은 관리자 모드에서만 선택 가능(일반 모드에서는 흡수되어 접근 불가).
+  if (nextType === PHOTO_TYPES.TEMPERATURE && !isAdminMode) {
+    return;
+  }
   if (activePhotoType === nextType) {
     renderPhotoTypeControls();
     return;
@@ -1711,33 +1778,344 @@ function renderPhotoTypeControls() {
     const isTemperatureButton = buttonPhotoType === PHOTO_TYPES.TEMPERATURE;
     button.setAttribute("aria-selected", String(selected));
     button.classList.toggle("active", selected);
-    button.classList.toggle("temperature-stealth-tab", isTemperatureButton && !isTemperatureAccessVisible);
-    button.classList.toggle("temperature-visible-tab", isTemperatureButton && isTemperatureAccessVisible);
+    button.classList.toggle("temperature-stealth-tab", isTemperatureButton && !isAdminMode);
+    button.classList.toggle("temperature-visible-tab", isTemperatureButton && isAdminMode);
   });
 }
 
-function loadTemperatureAccessVisible() {
+// ===== 관리자 모드 =====
+function loadAdminMode() {
   try {
-    return localStorage.getItem(TEMPERATURE_VISIBILITY_STORAGE_KEY) === "1";
+    return localStorage.getItem(ADMIN_MODE_STORAGE_KEY) === "1";
   } catch {
     return false;
   }
 }
 
-function setTemperatureAccessVisible(visible) {
-  isTemperatureAccessVisible = Boolean(visible);
+function setAdminMode(on) {
+  isAdminMode = Boolean(on);
   try {
-    localStorage.setItem(TEMPERATURE_VISIBILITY_STORAGE_KEY, isTemperatureAccessVisible ? "1" : "0");
+    localStorage.setItem(ADMIN_MODE_STORAGE_KEY, isAdminMode ? "1" : "0");
   } catch {
-    // 개인 표시 설정 저장 실패는 사진 저장과 별개로 조용히 무시합니다.
+    // 개인 설정 저장 실패는 사진 저장과 별개로 조용히 무시합니다.
+  }
+  applyAdminModeUi();
+
+  // 관리자 모드를 끄면서 온도측정 탭을 보고 있었다면 습윤양생으로 되돌립니다.
+  if (!isAdminMode && activePhotoType === PHOTO_TYPES.TEMPERATURE) {
+    setActivePhotoType(PHOTO_TYPES.CURING);
+  } else {
+    renderPhotoTypeControls();
+  }
+  renderAll();
+}
+
+function applyAdminModeUi() {
+  document.body.classList.toggle("admin-mode", isAdminMode);
+  // 타설일은 관리자 모드에서만 편집 가능(일반 모드는 잠금).
+  if (elements.pourDateInput) elements.pourDateInput.readOnly = !isAdminMode;
+  if (elements.prevPourDateButton) elements.prevPourDateButton.disabled = !isAdminMode;
+  if (elements.nextPourDateButton) elements.nextPourDateButton.disabled = !isAdminMode;
+  renderDaySlotBlindButton();
+}
+
+function cleanupLegacyPreferences() {
+  // 구 버전 "온도 표시/숨김" 개인 설정을 정리하고 관리자 모드로 흡수합니다.
+  try {
+    localStorage.removeItem(LEGACY_TEMPERATURE_VISIBILITY_STORAGE_KEY);
+  } catch {
+    // 무시
+  }
+}
+
+// ===== 일차 슬롯 구성(관리자 편집) =====
+function getStoredDaySlotList() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(DAY_SLOT_LIST_STORAGE_KEY) || "null");
+    if (Array.isArray(raw)) {
+      const cleaned = Array.from(
+        new Set(raw.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1))
+      ).sort((a, b) => a - b);
+      if (cleaned.length) return cleaned;
+    }
+  } catch {
+    // 무시하고 기본값 사용
+  }
+  return Array.from({ length: DEFAULT_DAY_SLOT_COUNT }, (_, index) => index + 1);
+}
+
+function saveDaySlotList(list) {
+  const cleaned = Array.from(
+    new Set((list || []).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1))
+  ).sort((a, b) => a - b);
+  const finalList = cleaned.length ? cleaned : [1];
+  try {
+    localStorage.setItem(DAY_SLOT_LIST_STORAGE_KEY, JSON.stringify(finalList));
+  } catch {
+    // 무시
+  }
+  return finalList;
+}
+
+function loadDaySlotBlindMode() {
+  try {
+    return localStorage.getItem(DAY_SLOT_BLIND_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function saveDaySlotBlindMode(enabled) {
+  try {
+    localStorage.setItem(DAY_SLOT_BLIND_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    // 무시
+  }
+}
+
+function renderDaySlotBlindButton() {
+  if (!elements.dayBlindButton) return;
+
+  const enabled = loadDaySlotBlindMode();
+  elements.dayBlindButton.setAttribute("aria-pressed", String(enabled));
+  elements.dayBlindButton.classList.toggle("active", enabled);
+  elements.dayBlindButton.title = enabled ? "숨긴 일차를 다시 표시" : "설정 밖 일차를 한 번에 숨김";
+
+  const label = elements.dayBlindButton.querySelector(".button-label");
+  if (label) {
+    label.textContent = enabled ? "블라인드 해제" : "일차 블라인드";
+  }
+}
+
+function setAllBoardsToTwoDaySlots() {
+  if (!isAdminMode) return;
+
+  const ok = window.confirm(
+    "모든 타설부위를 1·2일차만 보이도록 변경합니다.\n\n3일차 이후 사진은 삭제하지 않고 블라인드 처리합니다."
+  );
+  if (!ok) return;
+
+  saveDaySlotList(Array.from({ length: TWO_DAY_SLOT_COUNT }, (_, index) => index + 1));
+  saveDaySlotBlindMode(true);
+  pasteTargetDay = null;
+  renderAll();
+  showToast("모든 타설부위를 2일차 기준으로 표시합니다.");
+}
+
+function toggleDaySlotBlindMode() {
+  if (!isAdminMode) return;
+
+  const enabled = !loadDaySlotBlindMode();
+  saveDaySlotBlindMode(enabled);
+  pasteTargetDay = null;
+  renderAll();
+  showToast(enabled ? "설정 밖 일차를 한 번에 가렸습니다." : "숨긴 일차를 다시 표시합니다.");
+}
+
+function getEntryItems(entries) {
+  if (Array.isArray(entries)) {
+    return entries.map((entry, index) => ({
+      entry,
+      dayNo: getEntryDayNo(entry, index + 1),
+    }));
   }
 
-  if (!isTemperatureAccessVisible && activePhotoType === PHOTO_TYPES.TEMPERATURE) {
-    setActivePhotoType(PHOTO_TYPES.CURING);
+  return Object.entries(entries || {}).map(([key, entry]) => ({
+    entry,
+    dayNo: getEntryDayNo(entry, key),
+  }));
+}
+
+function getEntryDayNo(entry, fallback) {
+  const dayNo = Number(entry?.dayNo ?? entry?.day_no ?? fallback);
+  return Number.isInteger(dayNo) && dayNo >= 1 ? dayNo : 0;
+}
+
+function hasDaySlotData(entry) {
+  return (
+    hasEntryPhoto(entry, PHOTO_TYPES.CURING) ||
+    hasEntryPhoto(entry, PHOTO_TYPES.TEMPERATURE) ||
+    isRainHoldEntry(entry)
+  );
+}
+
+// 실제 표시 일차 = 설정된 슬롯 ∪ 이미 사진/데이터가 있는 일차(블라인드가 꺼져 있을 때만 하위 호환 표시).
+function getDaySlotList(entries = state.entries) {
+  const set = new Set(getStoredDaySlotList());
+  if (!loadDaySlotBlindMode()) {
+    getEntryItems(entries).forEach(({ entry, dayNo }) => {
+      if (!dayNo || !entry || !hasDaySlotData(entry)) return;
+      set.add(dayNo);
+    });
+  }
+  return Array.from(set).sort((a, b) => a - b);
+}
+
+function getDaySlotCount(entries = state.entries) {
+  return getDaySlotList(entries).length;
+}
+
+function addDaySlot() {
+  const list = getStoredDaySlotList();
+  const displayed = getDaySlotList();
+  if (displayed.length >= MAX_DAY_SLOT_COUNT) {
+    showToast(`일차는 최대 ${MAX_DAY_SLOT_COUNT}개까지 추가할 수 있습니다.`);
+    return;
+  }
+  const nextDay = (displayed[displayed.length - 1] || 0) + 1;
+  list.push(nextDay);
+  saveDaySlotList(list);
+  renderAll();
+  showToast(`${getPhotoSlotLabel(nextDay, PHOTO_TYPES.CURING)}을(를) 추가했습니다.`);
+}
+
+async function removeDaySlot(day) {
+  const dayNo = Number(day);
+  if (!Number.isInteger(dayNo) || dayNo < 1) return;
+  if (getDaySlotList().length <= 1) {
+    showToast("최소 1개의 일차는 남겨야 합니다.");
     return;
   }
 
-  renderPhotoTypeControls();
+  const entry = state.entries[dayNo];
+  const photoCount =
+    (entry && hasEntryPhoto(entry, PHOTO_TYPES.CURING) ? 1 : 0) +
+    (entry && hasEntryPhoto(entry, PHOTO_TYPES.TEMPERATURE) ? 1 : 0);
+  const label = getPhotoSlotLabel(dayNo, PHOTO_TYPES.CURING);
+
+  const confirmed = await confirmDangerousAction({
+    title: `${label} 삭제`,
+    message:
+      photoCount > 0
+        ? `${label}에 등록된 사진 ${photoCount}장이 함께 삭제됩니다. 되돌릴 수 없습니다.`
+        : `${label} 칸을 삭제합니다.`,
+    confirmLabel: "삭제",
+    countdownSeconds: photoCount > 0 ? 3 : 0,
+  });
+  if (!confirmed) return;
+
+  // 사진이 있으면 먼저 저장소에서 삭제
+  if (entry) {
+    if (hasEntryPhoto(entry, PHOTO_TYPES.CURING)) await deletePhoto(PHOTO_TYPES.CURING, dayNo, { skipConfirm: true });
+    if (hasEntryPhoto(entry, PHOTO_TYPES.TEMPERATURE)) await deletePhoto(PHOTO_TYPES.TEMPERATURE, dayNo, { skipConfirm: true });
+    delete state.entries[dayNo];
+  }
+
+  const remaining = getStoredDaySlotList().filter((value) => value !== dayNo);
+  saveDaySlotList(remaining);
+  renderAll();
+  showToast(`${label}을(를) 삭제했습니다.`);
+}
+
+function renameDaySlot(day) {
+  const dayNo = Number(day);
+  if (!Number.isInteger(dayNo) || dayNo < 1) return;
+  const labels = loadDaySlotLabels();
+  const current = typeof labels[dayNo] === "string" ? labels[dayNo] : "";
+  const input = window.prompt(
+    `${dayNo}번째 칸의 이름을 입력하세요. (비우면 "${dayNo}일차"로 표시)`,
+    current
+  );
+  if (input === null) return; // 취소
+  const trimmed = input.trim();
+  if (trimmed) {
+    labels[dayNo] = trimmed;
+  } else {
+    delete labels[dayNo];
+  }
+  saveDaySlotLabels(labels);
+  renderAll();
+  showToast("일차 이름을 변경했습니다.");
+}
+
+function loadDaySlotLabels() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(DAY_SLOT_LABELS_STORAGE_KEY) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveDaySlotLabels(map) {
+  try {
+    localStorage.setItem(DAY_SLOT_LABELS_STORAGE_KEY, JSON.stringify(map || {}));
+  } catch {
+    // 무시
+  }
+}
+
+function getDaySlotCustomLabel(day) {
+  const value = loadDaySlotLabels()[Number(day)];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+// ===== 위험 작업 확인 다이얼로그(사진 개수 표시 + 카운트다운) =====
+function confirmDangerousAction({ title, message, confirmLabel = "삭제", countdownSeconds = 0 } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "confirm-overlay";
+    overlay.innerHTML = `
+      <div class="confirm-dialog" role="dialog" aria-modal="true">
+        <h3 class="confirm-title"></h3>
+        <p class="confirm-message"></p>
+        <div class="confirm-actions">
+          <button type="button" class="small-button confirm-cancel">취소</button>
+          <button type="button" class="small-button danger-button confirm-ok"></button>
+        </div>
+      </div>
+    `;
+    overlay.querySelector(".confirm-title").textContent = title || "확인";
+    overlay.querySelector(".confirm-message").textContent = message || "";
+    const okButton = overlay.querySelector(".confirm-ok");
+    const cancelButton = overlay.querySelector(".confirm-cancel");
+
+    let remaining = Math.max(0, Math.round(countdownSeconds));
+    let timer = 0;
+
+    const updateOkLabel = () => {
+      if (remaining > 0) {
+        okButton.disabled = true;
+        okButton.textContent = `${confirmLabel} (${remaining})`;
+      } else {
+        okButton.disabled = false;
+        okButton.textContent = confirmLabel;
+      }
+    };
+
+    const cleanup = (result) => {
+      if (timer) window.clearInterval(timer);
+      document.removeEventListener("keydown", onKeydown, true);
+      overlay.remove();
+      resolve(result);
+    };
+
+    const onKeydown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cleanup(false);
+      }
+    };
+
+    okButton.addEventListener("click", () => cleanup(true));
+    cancelButton.addEventListener("click", () => cleanup(false));
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) cleanup(false);
+    });
+    document.addEventListener("keydown", onKeydown, true);
+
+    updateOkLabel();
+    if (remaining > 0) {
+      timer = window.setInterval(() => {
+        remaining -= 1;
+        updateOkLabel();
+        if (remaining <= 0) window.clearInterval(timer);
+      }, 1000);
+    }
+
+    document.body.appendChild(overlay);
+    cancelButton.focus();
+  });
 }
 
 function normalizeEntryShape(entry) {
@@ -1833,12 +2211,16 @@ function isCompletedEntry(entry, photoType = PHOTO_TYPES.CURING) {
   return hasEntryPhoto(entry, photoType);
 }
 
-function countCompletedEntries(entries, photoType = PHOTO_TYPES.CURING) {
-  return Object.values(entries || {}).filter((entry) => isCompletedEntry(entry, photoType)).length;
+function countCompletedEntries(entries, photoType = PHOTO_TYPES.CURING, visibleDaySet = null) {
+  return getEntryItems(entries).filter(({ entry, dayNo }) => {
+    if (visibleDaySet && !visibleDaySet.has(dayNo)) return false;
+    return isCompletedEntry(entry, photoType);
+  }).length;
 }
 
-function countPhotoEntries(entries) {
-  return Object.values(entries || {}).reduce((count, entry) => {
+function countPhotoEntries(entries, visibleDaySet = null) {
+  return getEntryItems(entries).reduce((count, { entry, dayNo }) => {
+    if (visibleDaySet && !visibleDaySet.has(dayNo)) return count;
     return count + Object.values(PHOTO_TYPES).filter((photoType) => hasEntryPhoto(entry, photoType)).length;
   }, 0);
 }
@@ -1905,6 +2287,8 @@ function normalizeEntryMemo(memo) {
 
 function renderAll() {
   renderPhotoTypeControls();
+  renderDaySlotBlindButton();
+  renderBoardListExpandButton();
   renderBoardList();
   renderSummary();
   if (!isFilePickerOpen) {
@@ -1916,6 +2300,8 @@ function renderAll() {
 
 function renderMetaPreview() {
   renderPhotoTypeControls();
+  renderDaySlotBlindButton();
+  renderBoardListExpandButton();
   renderSummary();
   if (!isFilePickerOpen) {
     renderDayGrid();
@@ -1981,6 +2367,7 @@ async function flushPendingRealtimeRefresh() {
 
 function renderBoardList() {
   cancelScheduledBoardListRender();
+  renderBoardListExpandButton();
 
   const visibleBoards = getVisibleBoardList();
   if (!visibleBoards.length) {
@@ -1996,14 +2383,18 @@ function renderBoardList() {
   elements.boardList.innerHTML = visibleBoards
     .map((board) => {
       const active = board.shareCode === state.shareCode;
-      const curingCount = Number(board.completedCount || 0);
-      const temperatureCount = Number(board.temperatureCount || 0);
+      const boardEntries = board.entries || {};
+      const boardDaySlots = getDaySlotList(boardEntries);
+      const visibleDaySet = new Set(boardDaySlots);
+      const curingCount = countCompletedEntries(boardEntries, PHOTO_TYPES.CURING, visibleDaySet);
+      const temperatureCount = countCompletedEntries(boardEntries, PHOTO_TYPES.TEMPERATURE, visibleDaySet);
+      const boardDaySlotCount = Math.max(boardDaySlots.length, 1);
       return `
         <div class="board-list-item ${active ? "active" : ""}" data-board-code="${escapeAttribute(board.shareCode)}">
           <span class="board-date">${escapeHtml(formatListDate(board.pourDate))}</span>
           <span class="board-part">${escapeHtml(board.pourPart)}</span>
           <span class="board-counts">
-            <span class="board-count ${curingCount === DAY_COUNT ? "complete" : ""}">${curingCount}/${DAY_COUNT} 양생</span>
+            <span class="board-count ${curingCount >= boardDaySlotCount ? "complete" : ""}">${curingCount}/${boardDaySlotCount} 양생</span>
             ${
               temperatureCount > 0
                 ? `<span class="board-count temperature">${temperatureCount}장 측정</span>`
@@ -2014,6 +2405,26 @@ function renderBoardList() {
       `;
     })
     .join("");
+}
+
+function toggleBoardListExpanded() {
+  if (!elements.boardListSection) return;
+
+  const expanded = !elements.boardListSection.classList.contains("board-list-expanded");
+  elements.boardListSection.classList.toggle("board-list-expanded", expanded);
+  renderBoardListExpandButton();
+}
+
+function renderBoardListExpandButton() {
+  if (!elements.boardListExpandButton || !elements.boardListSection) return;
+
+  const expanded = elements.boardListSection.classList.contains("board-list-expanded");
+  elements.boardListExpandButton.setAttribute("aria-expanded", String(expanded));
+  elements.boardListExpandButton.setAttribute("aria-label", expanded ? "사진대지 목록 접기" : "사진대지 목록 펼치기");
+  elements.boardListExpandButton.title = expanded ? "사진대지 목록 접기" : "사진대지 목록 펼치기";
+
+  const icon = elements.boardListExpandButton.querySelector(".button-icon");
+  if (icon) icon.textContent = expanded ? "▴" : "▾";
 }
 
 function getVisibleBoardList() {
@@ -2072,27 +2483,32 @@ function clearBoardSearch() {
 
 function handleBoardSearchInput() {
   const value = elements.boardSearchInput.value;
-  if (applyTemperatureAccessCode(value)) return;
+  if (applyAdminCode(value)) return;
 
   boardSearchQuery = value;
   scheduleBoardListRender();
 }
 
-function applyTemperatureAccessCode(value) {
-  const code = String(value || "").trim();
-  if (code !== TEMPERATURE_SHOW_CODE && code !== TEMPERATURE_HIDE_CODE) return false;
+function applyAdminCode(value) {
+  // 검색창에 "관리자" 입력 시 관리자 모드 온/오프 토글.
+  if (!isAdminCode(value)) return false;
 
-  const willShow = code === TEMPERATURE_SHOW_CODE;
-  setTemperatureAccessVisible(willShow);
+  setAdminMode(!isAdminMode);
   boardSearchQuery = "";
   elements.boardSearchInput.value = "";
   renderBoardList();
-  showToast(willShow ? "이 기기에서 온도측정 버튼을 표시합니다." : "이 기기에서 온도측정 버튼을 숨깁니다.");
+  showToast(isAdminMode ? "관리자 모드를 켰습니다." : "관리자 모드를 껐습니다.");
   return true;
+}
+
+function isAdminCode(value) {
+  const normalized = normalizeSearchText(value).replace(/["'`“”‘’]/g, "");
+  return normalized === ADMIN_TOGGLE_CODE || normalized.includes(ADMIN_TOGGLE_CODE);
 }
 
 function normalizeSearchText(value) {
   return String(value || "")
+    .normalize("NFKC")
     .toLocaleLowerCase("ko-KR")
     .replace(/\s+/g, "");
 }
@@ -2131,7 +2547,8 @@ async function renderStorageMeter() {
 function renderDayGrid() {
   const photoType = activePhotoType;
   const typeConfig = getPhotoTypeConfig(photoType);
-  elements.dayGrid.innerHTML = days()
+  const canEditSlots = isAdminMode && photoType === PHOTO_TYPES.CURING;
+  let gridHtml = days()
     .map((day) => {
       const entry = getEntry(day);
       const photo = getTypedPhoto(entry, photoType);
@@ -2146,9 +2563,17 @@ function renderDayGrid() {
             <h3>${escapeHtml(slotLabel)}</h3>
             ${
               photoType === PHOTO_TYPES.CURING
-                ? `<button class="rain-toggle ${rainHold ? "active" : ""}" type="button" data-rain-day="${day}" aria-pressed="${rainHold}" title="${day}일차 우천 대기 표시" aria-label="${day}일차 우천 대기 표시">
+                ? `<button class="rain-toggle ${rainHold ? "active" : ""}" type="button" data-rain-day="${day}" aria-pressed="${rainHold}" title="${escapeAttribute(slotLabel)} 우천 대기 표시" aria-label="${escapeAttribute(slotLabel)} 우천 대기 표시">
                     <span aria-hidden="true">☔</span>
                   </button>`
+                : ""
+            }
+            ${
+              canEditSlots
+                ? `<span class="slot-admin-controls admin-only">
+                    <button class="icon-mini" type="button" data-rename-day="${day}" title="일차 이름 변경" aria-label="${escapeAttribute(slotLabel)} 이름 변경"><span aria-hidden="true">✎</span></button>
+                    <button class="icon-mini danger" type="button" data-remove-day="${day}" title="이 일차 삭제" aria-label="${escapeAttribute(slotLabel)} 삭제"><span aria-hidden="true">🗑</span></button>
+                  </span>`
                 : ""
             }
             <span class="date-pill">${escapeHtml(slotDateLabel)}</span>
@@ -2173,7 +2598,7 @@ function renderDayGrid() {
                 <input id="gallery-${day}" class="file-input" data-day="${day}" data-photo-type="${escapeAttribute(photoType)}" type="file" accept="image/*" multiple aria-label="${escapeAttribute(slotLabel)} ${escapeAttribute(typeConfig.label)} 사진 첨부">
               </div>
               ${
-                hasPhoto
+                hasPhoto && isAdminMode
                   ? `<button class="small-button danger-button" type="button" data-delete-day="${day}" data-delete-type="${escapeAttribute(photoType)}">
                       <span class="button-icon" aria-hidden="true">×</span>
                       <span>삭제</span>
@@ -2181,12 +2606,25 @@ function renderDayGrid() {
                   : ""
               }
             </div>
-            ${hasPhoto ? `<div class="uploaded-meta">${renderUploadedMeta(photo)}</div>` : ""}
+            ${hasPhoto && isAdminMode ? `<div class="uploaded-meta admin-only">${renderUploadedMeta(photo)}</div>` : ""}
           </div>
         </article>
       `;
     })
     .join("");
+
+  if (canEditSlots && getDaySlotList().length < MAX_DAY_SLOT_COUNT) {
+    gridHtml += `
+      <article class="day-card add-slot-card admin-only">
+        <button type="button" class="add-slot-button" data-add-slot title="일차 추가">
+          <span class="add-slot-plus" aria-hidden="true">＋</span>
+          <span>일차 추가</span>
+        </button>
+      </article>
+    `;
+  }
+
+  elements.dayGrid.innerHTML = gridHtml;
 
   if (pasteTargetDay) {
     const armed = elements.dayGrid.querySelector(`[data-paste-day="${pasteTargetDay}"]`);
@@ -2298,12 +2736,13 @@ function getPrintSlots(photoType = activePhotoType) {
 
 function getPrintPageGroups(photoType = activePhotoType) {
   const normalizedType = normalizePhotoType(photoType);
-  if (normalizedType === PHOTO_TYPES.CURING) return PRINT_PAGE_GROUPS;
-
+  // 일차 수에 맞춰 페이지 그룹을 동적으로 구성(페이지당 PRINT_PAGE_GROUP_SIZE일차).
   const slots = getPrintSlots(normalizedType);
   const groups = [];
-  for (let index = 0; index < slots.length; index += 2) {
-    groups.push([slots[index], slots[index + 1] || null]);
+  for (let index = 0; index < slots.length; index += PRINT_PAGE_GROUP_SIZE) {
+    const group = slots.slice(index, index + PRINT_PAGE_GROUP_SIZE);
+    while (group.length < PRINT_PAGE_GROUP_SIZE) group.push(null);
+    groups.push(group);
   }
   return groups;
 }
@@ -3048,7 +3487,7 @@ function isHeicFile(file) {
 }
 
 function days() {
-  return Array.from({ length: DAY_COUNT }, (_, index) => index + 1);
+  return getDaySlotList();
 }
 
 function formatDayDate(day) {

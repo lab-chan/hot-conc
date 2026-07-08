@@ -139,6 +139,22 @@ p {
   flex-wrap: nowrap;
 }
 
+.board-list-expand-button {
+  flex: 0 0 auto;
+  width: 36px;
+  min-width: 36px;
+  margin-left: auto;
+  gap: 0;
+  padding: 0;
+  font-size: 12px;
+}
+
+.board-list-expand-button[aria-expanded="true"] {
+  border-color: rgba(31, 122, 90, 0.42);
+  background: var(--accent-soft);
+  color: var(--accent-dark);
+}
+
 .storage-meter {
   width: min(230px, 32vw);
   min-width: 150px;
@@ -335,6 +351,38 @@ input:focus {
 
 .day-section .section-title-row {
   align-items: center;
+  flex-wrap: wrap;
+}
+
+.day-section-actions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+}
+
+.admin-day-tools {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.admin-tool-button {
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.admin-tool-button[aria-pressed="true"],
+.admin-tool-button.active {
+  border-color: rgba(31, 122, 90, 0.42);
+  background: var(--accent);
+  color: #fff;
 }
 
 .photo-type-tabs {
@@ -585,6 +633,11 @@ input:focus {
   max-height: 180px;
   overflow: auto;
   padding-right: 2px;
+  transition: max-height 180ms ease;
+}
+
+.board-list-section.board-list-expanded .board-list {
+  max-height: min(62vh, 720px);
 }
 
 .board-list-item {
@@ -1335,6 +1388,10 @@ body.viewer-open {
     justify-content: flex-end;
   }
 
+  .board-list-expand-button {
+    margin-left: 0;
+  }
+
   .topbar-actions {
     align-items: center;
     margin-left: auto;
@@ -1416,6 +1473,24 @@ body.viewer-open {
   .storage-meter {
     width: min(180px, 48vw);
     min-width: 140px;
+  }
+
+  .board-list-section .panel-heading {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .board-list-expand-button {
+    min-width: 104px;
+    flex: 0 0 36px;
+  }
+
+  .list-tools {
+    flex: 1 1 100%;
+  }
+
+  .board-list-section.board-list-expanded .board-list {
+    max-height: 58vh;
   }
 
   .summary-list {
@@ -1579,3 +1654,164 @@ body.viewer-open {
     break-after: auto;
   }
 }
+
+/* ============================================================
+   관리자 모드 (검색창에 "관리자" 입력 시 토글)
+   ============================================================ */
+
+/* 관리자 모드 표시 배지 */
+body.admin-mode::before {
+  content: "관리자 모드 · 검색창에 \201C관리자\201D 재입력 시 종료";
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 2147483000;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--accent-dark);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.01em;
+  box-shadow: 0 6px 18px rgba(21, 93, 69, 0.35);
+  pointer-events: none;
+}
+
+body:not(.admin-mode) .admin-only {
+  display: none !important;
+}
+
+/* 일차 슬롯 편집 컨트롤 (이름변경 / 삭제) */
+.slot-admin-controls {
+  display: inline-flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.icon-mini {
+  width: 26px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--muted);
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-mini:hover {
+  border-color: rgba(31, 122, 90, 0.4);
+  background: var(--accent-soft);
+  color: var(--accent-dark);
+}
+
+.icon-mini.danger:hover {
+  border-color: rgba(180, 58, 51, 0.4);
+  background: #fbecea;
+  color: var(--danger);
+}
+
+/* 일차 추가 카드 */
+.add-slot-card {
+  display: flex;
+  border: 1px dashed var(--line);
+  background: var(--surface-soft);
+  border-radius: 14px;
+  min-height: 120px;
+  overflow: hidden;
+}
+
+.add-slot-button {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--accent-dark);
+  font-size: 14px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.add-slot-button:hover {
+  background: var(--accent-soft);
+}
+
+.add-slot-plus {
+  font-size: 28px;
+  line-height: 1;
+}
+
+/* 타설일 잠금 (일반 모드에서는 읽기 전용) */
+#pourDateInput:read-only {
+  background: var(--surface-soft);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.date-step-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+body:not(.admin-mode) .date-stepper::after {
+  content: "🔒";
+  align-self: center;
+  margin-left: 2px;
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+/* 위험 작업 확인 다이얼로그 (사진 개수 표시 + 카운트다운) */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(20, 24, 20, 0.5);
+}
+
+.confirm-dialog {
+  width: 100%;
+  max-width: 340px;
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 20px;
+  box-shadow: var(--shadow);
+}
+
+.confirm-title {
+  margin: 0 0 8px;
+  font-size: 17px;
+}
+
+.confirm-message {
+  margin: 0 0 18px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirm-ok:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 일반 모드에서는 온도측정 탭을 완전히 비활성화(관리자 모드로 흡수) */
+.photo-type-tab.temperature-stealth-tab { pointer-events: none; }
