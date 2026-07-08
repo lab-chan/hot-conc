@@ -117,7 +117,6 @@ const elements = {
   searchButton: document.getElementById("searchButton"),
   printButton: document.getElementById("printButton"),
   newBoardButton: document.getElementById("newBoardButton"),
-  setTwoDayAllButton: document.getElementById("setTwoDayAllButton"),
   dayBlindButton: document.getElementById("dayBlindButton"),
   boardSearchBar: document.getElementById("boardSearchBar"),
   boardSearchInput: document.getElementById("boardSearchInput"),
@@ -148,6 +147,7 @@ const config = window.CONCRETE_PHOTO_CONFIG || {};
 let dbClient = null;
 let realtimeChannel = null;
 let metaSaveTimer = null;
+let isMetaSaveInProgress = false;
 let lastSyncedMeta = { projectName: "", pourPart: "", pourDate: "" };
 let boardList = [];
 let boardSearchQuery = "";
@@ -246,7 +246,6 @@ function bindEvents() {
   elements.boardListExpandButton?.addEventListener("click", toggleBoardListExpanded);
   elements.printButton.addEventListener("click", handlePrint);
   elements.newBoardButton.addEventListener("click", createNewBoard);
-  elements.setTwoDayAllButton?.addEventListener("click", setAllBoardsToTwoDaySlots);
   elements.dayBlindButton?.addEventListener("click", toggleDaySlotBlindMode);
   elements.prevPourDateButton.addEventListener("click", () => shiftPourDate(-1));
   elements.nextPourDateButton.addEventListener("click", () => shiftPourDate(1));
@@ -1242,7 +1241,7 @@ function pullMetaFromInputs() {
 
 function queueMetaSave() {
   window.clearTimeout(metaSaveTimer);
-  metaSaveTimer = window.setTimeout(saveMeta, 300);
+  metaSaveTimer = window.setTimeout(() => saveMeta({ allowConfirm: false }).catch(console.error), 300);
 }
 
 function flushMetaSave(options = {}) {
@@ -1250,11 +1249,16 @@ function flushMetaSave(options = {}) {
   saveMetaDraft();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
-  saveMeta(options).catch(console.error);
+  saveMeta({ ...options, allowConfirm: options.silent ? false : options.allowConfirm !== false }).catch(console.error);
 }
 
 async function saveMeta(options = {}) {
   const silent = options.silent === true;
+  const allowConfirm = options.allowConfirm !== false && !silent;
+  if (isMetaSaveInProgress) return;
+  isMetaSaveInProgress = true;
+
+  try {
   pullMetaFromInputs();
 
   if (!state.pourDate) {
@@ -1273,12 +1277,14 @@ async function saveMeta(options = {}) {
   if (!hasMetaChange) return;
 
   if (countPhotoEntries(state.entries || {}) > 0 && metaChangedFromSynced()) {
-    if (silent) return;
+    if (!allowConfirm) return;
     const ok = window.confirm(
       `이미 사진이 등록된 대지입니다.\n\n${describeMetaChange()}\n\n이대로 저장할까요?`
     );
     if (!ok) {
       revertMetaInputsToSynced();
+      clearMetaDraft();
+      renderMetaPreview();
       return;
     }
   }
@@ -1312,6 +1318,9 @@ async function saveMeta(options = {}) {
     await loadBoardList();
     renderBoardList();
     renderStorageMeter();
+  }
+  } finally {
+    isMetaSaveInProgress = false;
   }
 }
 
@@ -1695,11 +1704,6 @@ async function deletePhoto(photoType, day, { skipConfirm = false } = {}) {
   const entry = getEntry(day);
   const previousPhoto = getTypedPhoto(entry, normalizedType);
   if (!previousPhoto.photoUrl) return;
-  // 사진 삭제는 관리자 전용(내부 호출은 skipConfirm으로 통과).
-  if (!isAdminMode && !skipConfirm) {
-    showToast("관리자 모드에서만 사진을 삭제할 수 있습니다.");
-    return;
-  }
   if (!skipConfirm) {
     const ok = window.confirm(`${slotLabel} ${typeConfig.label} 사진을 삭제할까요?`);
     if (!ok) return;
@@ -1736,6 +1740,11 @@ async function toggleRainHold(day) {
 
   const entry = getEntry(day);
   const previousRainHold = isRainHoldEntry(entry);
+  if (!previousRainHold && hasEntryPhoto(entry, PHOTO_TYPES.CURING)) {
+    showToast("사진이 등록된 일차는 사진 삭제 후 우천대기로 변경해 주세요.");
+    return;
+  }
+
   entry.rainHold = !previousRainHold;
   renderAll();
 
@@ -2670,7 +2679,7 @@ function renderDayGrid() {
                 <input id="gallery-${day}" class="file-input" data-day="${day}" data-photo-type="${escapeAttribute(photoType)}" type="file" accept="image/*" multiple aria-label="${escapeAttribute(slotLabel)} ${escapeAttribute(typeConfig.label)} 사진 첨부">
               </div>
               ${
-                hasPhoto && isAdminMode
+                hasPhoto
                   ? `<button class="small-button danger-button" type="button" data-delete-day="${day}" data-delete-type="${escapeAttribute(photoType)}">
                       <span class="button-icon" aria-hidden="true">×</span>
                       <span>삭제</span>
