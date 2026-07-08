@@ -62,6 +62,9 @@ const PRINT_MAIN_WIDTH_MM = 113.91;
 const PRINT_DAY_WIDTH_MM = 16.08;
 const PRINT_PHOTO_ROW_HEIGHT_MM = 84;
 const PRINT_INFO_ROW_HEIGHT_MM = 10.525;
+const DELETED_BOARD_PROJECT_NAME = "__deleted_photo_board__";
+const DELETED_BOARD_LABEL = "[삭제됨]";
+const HIDDEN_BOARD_CODES_STORAGE_KEY = "concrete-photo-board-ui:hidden-board-codes";
 const PRINT_PHOTO_WIDTH_MM = 120;
 const PRINT_PHOTO_HEIGHT_MM = 80;
 const STANDARD_DOCUMENT_MIN_ZOOM = 0.75;
@@ -923,6 +926,12 @@ async function loadCloudBoard(options = {}) {
   const requestedShareCode = state.shareCode;
   const shouldSyncInputs = options.syncInputs !== false;
   const createIfMissing = options.createIfMissing === true;
+  if (loadHiddenBoardCodes().has(requestedShareCode)) {
+    resetCurrentBoard({ keepShareCode: true });
+    clearMetaDraft();
+    return null;
+  }
+
   const { data: board, error } = await dbClient
     .from("photo_boards")
     .select("*, photo_entries(*)")
@@ -933,6 +942,12 @@ async function loadCloudBoard(options = {}) {
   if (state.shareCode !== requestedShareCode) return null;
 
   if (board) {
+    if (isDeletedBoardRecord(board)) {
+      resetCurrentBoard({ keepShareCode: true });
+      clearMetaDraft();
+      return null;
+    }
+
     state.boardId = board.id;
     state.projectName = normalizeProjectName(board.project_name || DEFAULT_PROJECT_NAME);
     state.pourPart = board.pour_part || "";
@@ -1021,7 +1036,34 @@ async function loadBoardList() {
   await reconcileCurrentBoardEntries();
 }
 
+function loadHiddenBoardCodes() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(HIDDEN_BOARD_CODES_STORAGE_KEY) || "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter(Boolean).map(String) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveHiddenBoardCode(shareCode) {
+  if (!shareCode) return;
+  try {
+    const hidden = loadHiddenBoardCodes();
+    hidden.add(String(shareCode));
+    localStorage.setItem(HIDDEN_BOARD_CODES_STORAGE_KEY, JSON.stringify(Array.from(hidden)));
+  } catch {
+    // 무시
+  }
+}
+
+function isDeletedBoardRecord(board) {
+  const projectName = board?.project_name ?? board?.projectName ?? "";
+  const pourPart = board?.pour_part ?? board?.pourPart ?? "";
+  return projectName === DELETED_BOARD_PROJECT_NAME || String(pourPart).startsWith(DELETED_BOARD_LABEL);
+}
+
 async function loadCloudBoardList() {
+  const hiddenBoardCodes = loadHiddenBoardCodes();
   const { data, error } = await dbClient
     .from("photo_boards")
     .select("id, share_code, project_name, pour_part, pour_date, created_at, updated_at, photo_entries(day_no, photo_url, memo)")
@@ -1030,10 +1072,13 @@ async function loadCloudBoardList() {
     .order("created_at", { ascending: false });
   if (error) throw error;
 
-  boardList = (data || []).map((board) => {
+  boardList = (data || []).filter((board) => {
+    return board.share_code && !hiddenBoardCodes.has(board.share_code) && !isDeletedBoardRecord(board);
+  }).map((board) => {
     const pourPart = board.pour_part || "미입력";
     const entries = board.photo_entries || [];
     return {
+      boardId: board.id,
       shareCode: board.share_code,
       projectName: normalizeProjectName(board.project_name || DEFAULT_PROJECT_NAME),
       pourPart,
@@ -1050,6 +1095,7 @@ async function loadCloudBoardList() {
 }
 
 function loadLocalBoardList() {
+  const hiddenBoardCodes = loadHiddenBoardCodes();
   boardList = Object.keys(localStorage)
     .filter((key) => key.startsWith(LOCAL_PREFIX) && !key.startsWith(META_DRAFT_PREFIX))
     .map((key) => {
@@ -1075,7 +1121,7 @@ function loadLocalBoardList() {
       }
     })
     .filter(Boolean)
-    .filter((board) => Boolean(board.pourDate))
+    .filter((board) => Boolean(board.pourDate) && !hiddenBoardCodes.has(board.shareCode) && !isDeletedBoardRecord(board))
     .sort((a, b) => {
       const dateCompare = (b.pourDate || "").localeCompare(a.pourDate || "");
       if (dateCompare) return dateCompare;
@@ -3367,7 +3413,14 @@ async function deleteBoardByShareCode(shareCode) {
     return;
   }
 
-  const target = await loadBoardDeleteTarget(shareCode);
+  let target = null;
+  try {
+    target = await loadBoardDeleteTarget(shareCode);
+  } catch (error) {
+    console.error(error);
+    showToast("삭제할 사진대지를 확인하지 못했습니다.");
+    return;
+  }
   if (!target) {
     showToast("삭제할 사진대지를 찾지 못했습니다.");
     await loadBoardList();
@@ -3414,6 +3467,7 @@ async function deleteBoardByShareCode(shareCode) {
     return;
   }
 
+  saveHiddenBoardCode(deletedShareCode);
   await loadBoardList();
 
   if (deletingCurrent) {
@@ -3474,16 +3528,31 @@ async function loadBoardDeleteTarget(shareCode) {
     };
   }
 
+  const listBoard = boardList.find((board) => board.shareCode === shareCode);
   const { data, error } = await dbClient
     .from("photo_boards")
-    .select("id, share_code, pour_part, photo_entries(*)")
+    .select("id, share_code, project_name, pour_part")
     .eq("share_code", shareCode)
     .maybeSingle();
   if (error) throw error;
-  if (!data) return null;
+  const board = data || (listBoard?.boardId ? {
+    id: listBoard.boardId,
+    share_code: listBoard.shareCode,
+    project_name: listBoard.projectName,
+    pour_part: listBoard.pourPart,
+  } : null);
+  if (!board || isDeletedBoardRecord(board)) return null;
 
   const entries = {};
-  (data.photo_entries || []).forEach((row) => {
+  const { data: entryRows, error: entryError } = await dbClient
+    .from("photo_entries")
+    .select("*")
+    .eq("board_id", board.id);
+  if (entryError) {
+    console.warn("Board delete entry lookup failed", entryError);
+  }
+
+  (entryRows || []).forEach((row) => {
     const memo = parseEntryMemo(row.memo);
     entries[row.day_no] = {
       dayNo: row.day_no,
@@ -3497,8 +3566,8 @@ async function loadBoardDeleteTarget(shareCode) {
 
   return {
     shareCode,
-    boardId: data.id,
-    pourPart: data.pour_part || "",
+    boardId: board.id,
+    pourPart: board.pour_part || "",
     entries: normalizeEntries(entries),
   };
 }
@@ -3507,33 +3576,72 @@ async function deleteCloudBoardTarget(target) {
   if (!dbClient || !target?.boardId) return false;
 
   const photoPaths = collectBoardPhotoPaths(target.entries || {});
-  let hardDeleted = false;
+  let hardDeleteError = null;
 
-  const { error: entryError } = await dbClient
-    .from("photo_entries")
-    .delete()
-    .eq("board_id", target.boardId);
-
-  if (!entryError) {
-    const { error: boardError } = await dbClient
-      .from("photo_boards")
+  try {
+    const { error: entryError } = await dbClient
+      .from("photo_entries")
       .delete()
-      .eq("id", target.boardId);
-    hardDeleted = !boardError;
+      .eq("board_id", target.boardId);
+
+    if (!entryError) {
+      const { error: boardError } = await dbClient
+        .from("photo_boards")
+        .delete()
+        .eq("id", target.boardId);
+      hardDeleteError = boardError;
+    } else {
+      hardDeleteError = entryError;
+    }
+  } catch (error) {
+    hardDeleteError = error;
   }
 
-  if (hardDeleted) {
+  const remainingAfterHardDelete = await fetchCloudBoardDeleteRecord(target.boardId);
+  if (!remainingAfterHardDelete) {
     await removeBoardStoragePaths(photoPaths);
     return true;
   }
+  if (hardDeleteError) {
+    console.warn("Hard board delete failed; using soft delete marker", hardDeleteError);
+  } else {
+    console.warn("Hard board delete did not remove the board; using soft delete marker");
+  }
 
-  const { error: archiveError } = await dbClient
-    .from("photo_boards")
-    .update({ pour_date: null, updated_at: new Date().toISOString() })
-    .eq("id", target.boardId);
-  if (archiveError) throw archiveError;
-
+  await markCloudBoardAsDeleted(target);
   return true;
+}
+
+async function fetchCloudBoardDeleteRecord(boardId) {
+  const { data, error } = await dbClient
+    .from("photo_boards")
+    .select("id, share_code, project_name, pour_part, pour_date")
+    .eq("id", boardId)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function markCloudBoardAsDeleted(target) {
+  const now = new Date().toISOString();
+  const deletedPourPart = `[deleted] ${target.pourPart || ""}`.trim();
+  const { data, error } = await dbClient
+    .from("photo_boards")
+    .update({
+      project_name: DELETED_BOARD_PROJECT_NAME,
+      pour_part: deletedPourPart,
+      updated_at: now,
+    })
+    .eq("id", target.boardId)
+    .select("id, share_code, project_name, pour_part, pour_date")
+    .maybeSingle();
+  if (error) throw error;
+  if (data && isDeletedBoardRecord(data)) return true;
+
+  const verified = await fetchCloudBoardDeleteRecord(target.boardId);
+  if (!verified || isDeletedBoardRecord(verified)) return true;
+
+  throw new Error("Board delete marker was not applied.");
 }
 
 function collectBoardPhotoPaths(entries) {
