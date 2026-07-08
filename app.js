@@ -46,6 +46,7 @@ const META_DRAFT_PREFIX = `${LOCAL_PREFIX}meta-draft:`;
 const SUPABASE_JS_URL = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js";
 const HEIC2ANY_URL = "https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js";
 const JSPDF_URL = "https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js";
+const SCRIPT_LOAD_TIMEOUT_MS = 10000;
 const STORAGE_DISPLAY_LIMIT_BYTES = 1024 * 1024 * 1024;
 const ESTIMATED_PHOTO_BYTES = 450 * 1024;
 const IMAGE_MAX_WIDTH = 1280;
@@ -201,7 +202,7 @@ async function init() {
       resetCurrentBoard();
     }
     await loadBoardList();
-    setSyncStatus("현재 브라우저에만 저장됩니다. 실시간 공유는 config.js 설정 후 사용할 수 있습니다.");
+    setSyncStatus("현재 브라우저에만 저장됩니다. 공유 저장소 연결을 확인해 주세요.");
   }
 
   renderAll();
@@ -843,22 +844,25 @@ async function setupCloudMode() {
     dbClient = null;
     loadLocalBoard();
     await loadBoardList();
-    setSyncStatus("실시간 연결에 실패했습니다. Supabase 설정을 확인해 주세요.");
+    setSyncStatus("실시간 연결에 실패했습니다.\n인터넷 연결을 확인한 뒤 새로고침해 주세요.");
   }
 }
 
 function ensureShareCode() {
   const url = new URL(window.location.href);
-  return url.searchParams.get("board") || "";
+  const shareCode = url.searchParams.get("board") || "";
+  clearBoardUrlParam(url);
+  return shareCode;
 }
 
 function syncUrlToCurrentBoard() {
-  const url = new URL(window.location.href);
-  if (state.shareCode) {
-    url.searchParams.set("board", state.shareCode);
-  } else {
-    url.searchParams.delete("board");
-  }
+  clearBoardUrlParam();
+}
+
+function clearBoardUrlParam(sourceUrl = null) {
+  const url = sourceUrl || new URL(window.location.href);
+  if (!url.searchParams.has("board")) return;
+  url.searchParams.delete("board");
   window.history.replaceState({}, "", url.toString());
 }
 
@@ -1628,6 +1632,10 @@ async function handlePhotoSelection(photoType, startDay, files) {
     const overflowText = getOverflowPhotoText(overflowCount, normalizedType);
     const invalidText = invalidCount > 0 ? ` 이미지가 아닌 파일 ${invalidCount}개는 제외했습니다.` : "";
     const failedText = failed > 0 ? ` 처리 실패 ${failed}장은 건너뛰었습니다.` : "";
+    const doneText = completed > 0
+      ? `${typeConfig.label} 사진 ${completed}장을 등록했습니다.`
+      : `${typeConfig.label} 사진을 등록하지 못했습니다.`;
+    showToast(`${doneText}${overflowText}${invalidText}${failedText}`);
   } catch (error) {
     console.error(error);
     await loadBoardList();
@@ -3092,6 +3100,7 @@ function getPrintCanvasFontPt(text) {
 function getPrintCanvasLines(ctx, value, maxWidth, maxLines, options = {}) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text) return [""];
+  if (ctx.measureText(text).width <= maxWidth) return [text];
 
   const segments = getPrintCanvasSegments(text, options);
   const lines = [];
@@ -3121,15 +3130,60 @@ function getPrintCanvasSegments(text, options = {}) {
   }
 
   const chars = Array.from(text);
-  const breakIndex = chars.findIndex((char, index) => {
+  const majorCommaBreakIndex = findTopLevelPrintBreakIndex(chars, [",", "，", "、"], (source, index) => {
+    return source.slice(index + 1).join("").trimStart().toUpperCase().startsWith("STA.");
+  });
+  if (majorCommaBreakIndex >= 0) {
+    return [
+      chars.slice(0, majorCommaBreakIndex + 1).join("").trim(),
+      chars.slice(majorCommaBreakIndex + 1).join("").trim(),
+    ].filter(Boolean);
+  }
+
+  const closeBracketIndex = chars.findIndex((char, index) => {
     return [")", "]", "}"].includes(char) && index < chars.length - 1;
   });
 
-  if (breakIndex < 0) return [text];
-  return [
-    chars.slice(0, breakIndex + 1).join("").trim(),
-    chars.slice(breakIndex + 1).join("").trim(),
-  ].filter(Boolean);
+  if (closeBracketIndex >= 0) {
+    return [
+      chars.slice(0, closeBracketIndex + 1).join("").trim(),
+      chars.slice(closeBracketIndex + 1).join("").trim(),
+    ].filter(Boolean);
+  }
+
+  const commaBreakIndex = findTopLevelPrintBreakIndex(chars, [",", "，", "、"]);
+  if (commaBreakIndex >= 0) {
+    return [
+      chars.slice(0, commaBreakIndex + 1).join("").trim(),
+      chars.slice(commaBreakIndex + 1).join("").trim(),
+    ].filter(Boolean);
+  }
+
+  return [text];
+}
+
+function findTopLevelPrintBreakIndex(chars, delimiters, predicate = null) {
+  let depth = 0;
+  for (let index = 0; index < chars.length; index += 1) {
+    const char = chars[index];
+    if (["(", "[", "{"].includes(char)) {
+      depth += 1;
+      continue;
+    }
+    if ([")", "]", "}"].includes(char)) {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (
+      depth === 0 &&
+      delimiters.includes(char) &&
+      index < chars.length - 1 &&
+      (!predicate || predicate(chars, index))
+    ) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function wrapPrintCanvasSegment(ctx, segment, maxWidth) {
@@ -3376,10 +3430,8 @@ async function createNewBoard() {
   boardLoadToken += 1;
   activePhotoType = DEFAULT_PHOTO_TYPE;
 
-  const url = new URL(window.location.href);
   const shareCode = createShareCode();
-  url.searchParams.set("board", shareCode);
-  window.history.replaceState({}, "", url.toString());
+  clearBoardUrlParam();
 
   state = {
     shareCode,
@@ -3689,9 +3741,7 @@ async function openBoard(shareCode) {
 
   const token = ++boardLoadToken;
   const selectedBoard = boardList.find((board) => board.shareCode === shareCode);
-  const url = new URL(window.location.href);
-  url.searchParams.set("board", shareCode);
-  window.history.replaceState({}, "", url.toString());
+  clearBoardUrlParam();
   state = {
     shareCode,
     boardId: null,
@@ -3928,27 +3978,56 @@ function isKakaoInAppBrowser() {
   return /KAKAOTALK/i.test(navigator.userAgent);
 }
 
-function loadScript(src) {
+function loadScript(src, timeoutMs = SCRIPT_LOAD_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const existing = document.querySelector(`script[src="${src}"]`);
+    let timeoutId = 0;
+    let targetScript = existing;
+
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      if (!targetScript) return;
+      targetScript.removeEventListener("load", onLoad);
+      targetScript.removeEventListener("error", onError);
+    };
+
+    const onLoad = () => {
+      if (targetScript) targetScript.dataset.loaded = "true";
+      cleanup();
+      resolve();
+    };
+
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    const onTimeout = () => {
+      cleanup();
+      if (targetScript && targetScript.dataset.loaded !== "true") {
+        targetScript.remove();
+      }
+      reject(new Error(`Script load timeout: ${src}`));
+    };
+
     if (existing) {
       if (existing.dataset.loaded === "true") {
         resolve();
         return;
       }
-      existing.addEventListener("load", () => resolve(), { once: true });
-      existing.addEventListener("error", reject, { once: true });
+      existing.addEventListener("load", onLoad, { once: true });
+      existing.addEventListener("error", onError, { once: true });
+      timeoutId = window.setTimeout(onTimeout, timeoutMs);
       return;
     }
 
     const script = document.createElement("script");
+    targetScript = script;
     script.src = src;
     script.async = true;
-    script.onload = () => {
-      script.dataset.loaded = "true";
-      resolve();
-    };
-    script.onerror = reject;
+    script.addEventListener("load", onLoad, { once: true });
+    script.addEventListener("error", onError, { once: true });
+    timeoutId = window.setTimeout(onTimeout, timeoutMs);
     document.head.appendChild(script);
   });
 }
