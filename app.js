@@ -1028,6 +1028,7 @@ function applyCloudEntries(entries) {
       photoUrl: row.photo_url || "",
       photoPath: row.photo_path || "",
       uploadedAt: row.uploaded_at || "",
+      verifiedAt: memo.photos?.[PHOTO_TYPES.CURING]?.verifiedAt || row.uploaded_at || "",
       capturedAt: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAt || "",
       capturedAtSource: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAtSource || "",
       rainHold: memo.rainHold,
@@ -1474,6 +1475,7 @@ function createEntryPersistPayload(day, photoType, entry, existing) {
     photoUrl: existing?.photo_url || "",
     photoPath: existing?.photo_path || "",
     uploadedAt: existing?.uploaded_at || "",
+    verifiedAt: existingMemo.photos?.[PHOTO_TYPES.CURING]?.verifiedAt || existing?.uploaded_at || "",
     capturedAt: existingMemo.photos?.[PHOTO_TYPES.CURING]?.capturedAt || "",
     capturedAtSource: existingMemo.photos?.[PHOTO_TYPES.CURING]?.capturedAtSource || "",
     rainHold: existingMemo.rainHold,
@@ -1493,6 +1495,7 @@ function createEntryPersistPayload(day, photoType, entry, existing) {
     merged.photoUrl = existingEntry.photoUrl || entry.photoUrl || "";
     merged.photoPath = existingEntry.photoPath || entry.photoPath || "";
     merged.uploadedAt = existingEntry.uploadedAt || entry.uploadedAt || "";
+    merged.verifiedAt = existingEntry.verifiedAt || entry.verifiedAt || "";
     merged.capturedAt = existingEntry.capturedAt || entry.capturedAt || "";
     merged.capturedAtSource = existingEntry.capturedAtSource || entry.capturedAtSource || "";
     merged.rainHold = existingEntry.rainHold || entry.rainHold || false;
@@ -1658,7 +1661,6 @@ async function handlePhotoSelection(photoType, startDay, files) {
 
 async function preparePhotoEntry(photoType, day, file) {
   const normalizedType = normalizePhotoType(photoType);
-  const photoTime = await readPhotoTimeInfo(file);
   const uploadFile = await prepareImageFile(file);
   const image = await resizeImage(uploadFile);
   const entry = getEntry(day);
@@ -1670,8 +1672,9 @@ async function preparePhotoEntry(photoType, day, file) {
     photoUrl: image.dataUrl,
     photoPath: "",
     uploadedAt,
-    capturedAt: photoTime.capturedAt || uploadedAt,
-    capturedAtSource: photoTime.capturedAtSource || "uploaded",
+    verifiedAt: uploadedAt,
+    capturedAt: "",
+    capturedAtSource: "",
     sizeBytes: image.blob.size,
   };
   setTypedPhoto(entry, normalizedType, nextPhoto);
@@ -2342,6 +2345,9 @@ function normalizeEntryShape(entry) {
 
   const memoCuringPhoto = memo.photos?.[PHOTO_TYPES.CURING];
   if (memoCuringPhoto) {
+    if (!entry.verifiedAt) {
+      entry.verifiedAt = memoCuringPhoto.verifiedAt || memoCuringPhoto.verified_at || entry.uploadedAt || entry.uploaded_at || "";
+    }
     if (!entry.capturedAt) {
       entry.capturedAt = memoCuringPhoto.capturedAt || memoCuringPhoto.captured_at || "";
     }
@@ -2378,6 +2384,7 @@ function getTypedPhoto(entry, photoType = activePhotoType) {
       photoUrl: source.photoUrl || source.photo_url || "",
       photoPath: source.photoPath || source.photo_path || "",
       uploadedAt: source.uploadedAt || source.uploaded_at || "",
+      verifiedAt: source.verifiedAt || source.verified_at || source.uploadedAt || source.uploaded_at || "",
       capturedAt: source.capturedAt || source.captured_at || "",
       capturedAtSource: source.capturedAtSource || source.captured_at_source || "",
       sizeBytes: Number(source.sizeBytes || 0),
@@ -2389,6 +2396,7 @@ function getTypedPhoto(entry, photoType = activePhotoType) {
     photoUrl: typed.photoUrl || typed.photo_url || "",
     photoPath: typed.photoPath || typed.photo_path || "",
     uploadedAt: typed.uploadedAt || typed.uploaded_at || "",
+    verifiedAt: typed.verifiedAt || typed.verified_at || typed.uploadedAt || typed.uploaded_at || "",
     capturedAt: typed.capturedAt || typed.captured_at || "",
     capturedAtSource: typed.capturedAtSource || typed.captured_at_source || "",
     sizeBytes: Number(typed.sizeBytes || 0),
@@ -2403,6 +2411,7 @@ function setTypedPhoto(entry, photoType, photo) {
     entry.photoUrl = photo.photoUrl || "";
     entry.photoPath = photo.photoPath || "";
     entry.uploadedAt = photo.uploadedAt || "";
+    entry.verifiedAt = photo.verifiedAt || photo.uploadedAt || "";
     entry.capturedAt = photo.capturedAt || "";
     entry.capturedAtSource = photo.capturedAtSource || "";
     entry.sizeBytes = Number(photo.sizeBytes || 0);
@@ -2414,6 +2423,7 @@ function setTypedPhoto(entry, photoType, photo) {
     photoUrl: photo.photoUrl || "",
     photoPath: photo.photoPath || "",
     uploadedAt: photo.uploadedAt || "",
+    verifiedAt: photo.verifiedAt || photo.uploadedAt || "",
     capturedAt: photo.capturedAt || "",
     capturedAtSource: photo.capturedAtSource || "",
     sizeBytes: Number(photo.sizeBytes || 0),
@@ -2425,6 +2435,7 @@ function clearTypedPhoto(entry, photoType) {
     photoUrl: "",
     photoPath: "",
     uploadedAt: "",
+    verifiedAt: "",
     capturedAt: "",
     capturedAtSource: "",
     sizeBytes: 0,
@@ -2488,11 +2499,12 @@ function serializeEntryMemo(entry) {
     ...(entry?.photos || {}),
   };
   const curingMeta = {
+    verifiedAt: entry?.verifiedAt || entry?.verified_at || entry?.uploadedAt || entry?.uploaded_at || "",
     capturedAt: entry?.capturedAt || entry?.captured_at || "",
     capturedAtSource: entry?.capturedAtSource || entry?.captured_at_source || "",
     sizeBytes: Number(entry?.sizeBytes || 0),
   };
-  if (curingMeta.capturedAt || curingMeta.capturedAtSource || curingMeta.sizeBytes) {
+  if (curingMeta.verifiedAt || curingMeta.capturedAt || curingMeta.capturedAtSource || curingMeta.sizeBytes) {
     photos[PHOTO_TYPES.CURING] = {
       ...(photos[PHOTO_TYPES.CURING] || {}),
       ...curingMeta,
@@ -2520,6 +2532,7 @@ function normalizeEntryMemo(memo) {
       photoUrl: memo?.photoUrl || memo?.photo_url || "",
       photoPath: memo?.photoPath || memo?.photo_path || "",
       uploadedAt: memo?.uploadedAt || memo?.uploaded_at || "",
+      verifiedAt: memo?.verifiedAt || memo?.verified_at || memo?.uploadedAt || memo?.uploaded_at || "",
       capturedAt: memo?.capturedAt || memo?.captured_at || memo?.takenAt || memo?.taken_at || "",
       capturedAtSource: memo?.capturedAtSource || memo?.captured_at_source || "",
       sizeBytes: memo?.sizeBytes || memo?.size_bytes || 0,
@@ -2534,6 +2547,7 @@ function normalizeEntryMemo(memo) {
     photoUrl: memo?.temperaturePhotoUrl || "",
     photoPath: memo?.temperaturePhotoPath || "",
     uploadedAt: memo?.temperatureUploadedAt || "",
+    verifiedAt: memo?.temperatureVerifiedAt || memo?.temperatureUploadedAt || "",
     capturedAt: memo?.temperatureCapturedAt || memo?.temperatureTakenAt || "",
     capturedAtSource: memo?.temperatureCapturedAtSource || "",
     sizeBytes: memo?.temperatureSizeBytes || 0,
@@ -2552,6 +2566,7 @@ function normalizePhotoMemo(photo, fallback = {}) {
     photoUrl: source.photoUrl || source.photo_url || fallback.photoUrl || "",
     photoPath: source.photoPath || source.photo_path || fallback.photoPath || "",
     uploadedAt: source.uploadedAt || source.uploaded_at || fallback.uploadedAt || "",
+    verifiedAt: source.verifiedAt || source.verified_at || fallback.verifiedAt || source.uploadedAt || source.uploaded_at || fallback.uploadedAt || "",
     capturedAt: source.capturedAt || source.captured_at || source.takenAt || source.taken_at || fallback.capturedAt || "",
     capturedAtSource: source.capturedAtSource || source.captured_at_source || fallback.capturedAtSource || "",
     sizeBytes: Number(source.sizeBytes || source.size_bytes || fallback.sizeBytes || 0),
@@ -2563,6 +2578,7 @@ function hasPhotoMemoData(photo) {
     photo?.photoUrl ||
     photo?.photoPath ||
     photo?.uploadedAt ||
+    photo?.verifiedAt ||
     photo?.capturedAt ||
     photo?.capturedAtSource ||
     Number(photo?.sizeBytes || 0)
@@ -2977,14 +2993,8 @@ function getPrintTextLengthScore(text) {
 
 function renderUploadedMeta(photo) {
   if (!photo.photoUrl) return "";
-  const capturedTime = photo.capturedAt ? formatDateTime(photo.capturedAt) : "";
-  if (capturedTime) {
-    const label = photo.capturedAtSource === "file" ? "사진일시" : photo.capturedAtSource === "uploaded" ? "등록" : "촬영";
-    return `${label} ${escapeHtml(capturedTime)} · 자동 압축`;
-  }
-
-  const uploadedTime = photo.uploadedAt ? formatDateTime(photo.uploadedAt) : "";
-  return uploadedTime ? `등록 ${escapeHtml(uploadedTime)} · 자동 압축` : "자동 압축";
+  const verifiedTime = photo.verifiedAt || photo.uploadedAt ? formatDateTime(photo.verifiedAt || photo.uploadedAt) : "";
+  return verifiedTime ? `검증 ${escapeHtml(verifiedTime)} · 자동 압축` : "검증일시 없음 · 자동 압축";
 }
 
 function openPhotoViewer(day, photoType = activePhotoType) {
@@ -3022,6 +3032,7 @@ function getPrintImageSignature() {
       day,
       photo.photoUrl || "",
       photo.uploadedAt || "",
+      photo.verifiedAt || "",
       photo.capturedAt || "",
       photoType === PHOTO_TYPES.CURING && isRainHoldEntry(entry),
     ];
@@ -3841,6 +3852,9 @@ async function loadBoardDeleteTarget(shareCode) {
       photoUrl: row.photo_url || "",
       photoPath: row.photo_path || "",
       uploadedAt: row.uploaded_at || "",
+      verifiedAt: memo.photos?.[PHOTO_TYPES.CURING]?.verifiedAt || row.uploaded_at || "",
+      capturedAt: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAt || "",
+      capturedAtSource: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAtSource || "",
       rainHold: memo.rainHold,
       photos: memo.photos || {},
     };
@@ -4015,139 +4029,6 @@ function getKnownPhotoBytes() {
   return Math.max(listPhotoCount, currentPhotoCount) * ESTIMATED_PHOTO_BYTES;
 }
 
-async function readPhotoTimeInfo(file) {
-  const exifTime = await readExifDateTime(file).catch(() => "");
-  if (exifTime) {
-    return {
-      capturedAt: exifTime,
-      capturedAtSource: "exif",
-    };
-  }
-
-  const modifiedTime = Number(file?.lastModified || 0);
-  if (modifiedTime > 0) {
-    return {
-      capturedAt: new Date(modifiedTime).toISOString(),
-      capturedAtSource: "file",
-    };
-  }
-
-  return {
-    capturedAt: "",
-    capturedAtSource: "",
-  };
-}
-
-async function readExifDateTime(file) {
-  if (!isJpegFile(file) || !file.slice || !file.arrayBuffer) return "";
-
-  const buffer = await file.slice(0, 1024 * 1024).arrayBuffer();
-  return parseJpegExifDateTime(buffer);
-}
-
-function parseJpegExifDateTime(buffer) {
-  if (!buffer || buffer.byteLength < 12) return "";
-
-  const view = new DataView(buffer);
-  if (view.getUint16(0, false) !== 0xffd8) return "";
-
-  let offset = 2;
-  while (offset + 4 <= view.byteLength) {
-    if (view.getUint8(offset) !== 0xff) {
-      offset += 1;
-      continue;
-    }
-
-    const marker = view.getUint8(offset + 1);
-    offset += 2;
-    if (marker === 0xda || marker === 0xd9) break;
-    if (marker >= 0xd0 && marker <= 0xd7) continue;
-    if (offset + 2 > view.byteLength) break;
-
-    const segmentLength = view.getUint16(offset, false);
-    if (segmentLength < 2) break;
-
-    const segmentStart = offset + 2;
-    const segmentEnd = offset + segmentLength;
-    if (segmentEnd > view.byteLength) break;
-
-    if (marker === 0xe1 && segmentLength >= 8 && readAscii(view, segmentStart, 6) === "Exif") {
-      return parseTiffExifDateTime(view, segmentStart + 6, segmentEnd);
-    }
-
-    offset = segmentEnd;
-  }
-
-  return "";
-}
-
-function parseTiffExifDateTime(view, tiffStart, tiffEnd) {
-  if (tiffStart + 8 > tiffEnd) return "";
-
-  const byteOrder = readAscii(view, tiffStart, 2);
-  const littleEndian = byteOrder === "II";
-  if (!littleEndian && byteOrder !== "MM") return "";
-
-  const readUint16 = (offset) => view.getUint16(offset, littleEndian);
-  const readUint32 = (offset) => view.getUint32(offset, littleEndian);
-  if (readUint16(tiffStart + 2) !== 42) return "";
-
-  const readIfd = (relativeOffset) => {
-    const ifdOffset = tiffStart + relativeOffset;
-    if (ifdOffset + 2 > tiffEnd) return {};
-
-    const entryCount = readUint16(ifdOffset);
-    const tags = {};
-    for (let index = 0; index < entryCount; index += 1) {
-      const entryOffset = ifdOffset + 2 + index * 12;
-      if (entryOffset + 12 > tiffEnd) break;
-
-      const tag = readUint16(entryOffset);
-      const type = readUint16(entryOffset + 2);
-      const count = readUint32(entryOffset + 4);
-      const valueOffset = entryOffset + 8;
-
-      if (type === 2) {
-        const asciiOffset = count <= 4 ? valueOffset : tiffStart + readUint32(valueOffset);
-        if (asciiOffset >= tiffStart && asciiOffset + count <= tiffEnd) {
-          tags[tag] = readAscii(view, asciiOffset, count).replace(/\0+$/g, "").trim();
-        }
-      } else if ((type === 3 || type === 4) && count === 1) {
-        tags[tag] = type === 3 ? readUint16(valueOffset) : readUint32(valueOffset);
-      }
-    }
-    return tags;
-  };
-
-  const rootTags = readIfd(readUint32(tiffStart + 4));
-  const exifTags = rootTags[0x8769] ? readIfd(rootTags[0x8769]) : {};
-  const dateText = exifTags[0x9003] || exifTags[0x9004] || rootTags[0x0132] || "";
-  const offsetText = exifTags[0x9011] || exifTags[0x9012] || exifTags[0x9010] || "";
-  return parseExifDateTimeText(dateText, offsetText);
-}
-
-function parseExifDateTimeText(dateText, offsetText = "") {
-  const match = String(dateText || "").match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
-  if (!match) return "";
-
-  const [, year, month, day, hour, minute, second] = match;
-  if (year === "0000" || month === "00" || day === "00") return "";
-
-  const normalizedOffset = normalizeExifTimeOffset(offsetText);
-  const date = normalizedOffset
-    ? new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}${normalizedOffset}`)
-    : new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
-
-  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
-}
-
-function normalizeExifTimeOffset(offsetText) {
-  const compact = String(offsetText || "").trim();
-  if (/^[+-]\d{2}:\d{2}$/.test(compact)) return compact;
-  if (/^[+-]\d{4}$/.test(compact)) return `${compact.slice(0, 3)}:${compact.slice(3)}`;
-  return "";
-}
-
 async function prepareImageFile(file) {
   if (!isHeicFile(file)) return file;
 
@@ -4238,23 +4119,8 @@ function isImageFile(file) {
   return /\.(jpe?g|png|webp|heic|heif)$/i.test(file.name || "");
 }
 
-function isJpegFile(file) {
-  return /jpe?g/i.test(file?.type || "") || /\.(jpe?g)$/i.test(file?.name || "");
-}
-
 function isHeicFile(file) {
   return /hei(c|f)/i.test(file.type || "") || /\.(heic|heif)$/i.test(file.name || "");
-}
-
-function readAscii(view, offset, length) {
-  let text = "";
-  const end = Math.min(view.byteLength, offset + Number(length || 0));
-  for (let index = offset; index < end; index += 1) {
-    const code = view.getUint8(index);
-    if (code === 0) break;
-    text += String.fromCharCode(code);
-  }
-  return text;
 }
 
 function days(photoType = activePhotoType, entries = state.entries) {
