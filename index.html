@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="ko">
   <head>
     <meta charset="utf-8">
@@ -7,7 +7,7 @@
     <meta name="darkreader-lock">
     <title>서중 콘크리트 습윤양생 사진대지</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="./styles.css?v=20260708-21">
+    <link rel="stylesheet" href="./styles.css?v=20260723-3">
     <script src="./config.js"></script>
   </head>
   <body>
@@ -77,9 +77,14 @@
             <div>
               <h2>사진대지 목록</h2>
             </div>
-            <button id="boardListExpandButton" class="small-button board-list-expand-button" type="button" aria-expanded="false" aria-label="사진대지 목록 펼치기" title="사진대지 목록 펼치기">
-              <span class="button-icon" aria-hidden="true">▾</span>
-            </button>
+            <div class="board-list-heading-buttons">
+              <button id="boardResultToggleButton" class="small-button board-list-tool-button" type="button" aria-controls="boardResultFilter" aria-expanded="false" aria-label="사진대지 결과 보기" title="사진대지 결과 보기">
+                <span class="button-icon" aria-hidden="true">▦</span>
+              </button>
+              <button id="boardListExpandButton" class="small-button board-list-tool-button board-list-expand-button" type="button" aria-expanded="false" aria-label="사진대지 목록 펼치기" title="사진대지 목록 펼치기">
+                <span class="button-icon" aria-hidden="true">▾</span>
+              </button>
+            </div>
             <div class="list-tools">
               <div id="storageMeter" class="storage-meter" aria-label="저장 용량">
                 <div class="storage-meter-row">
@@ -99,6 +104,16 @@
             </label>
             <button id="clearSearchButton" class="small-button" type="button">지움</button>
           </div>
+          <div id="boardResultFilter" class="board-result-filter" aria-label="사진대지 결과 보기" hidden>
+            <div class="board-result-tabs" role="group" aria-label="결과 보기 방식">
+              <button class="board-result-tab" type="button" data-board-result-view="all" aria-pressed="true">전체</button>
+              <button class="board-result-tab" type="button" data-board-result-view="month" aria-pressed="false">월별</button>
+              <button class="board-result-tab" type="button" data-board-result-view="day" aria-pressed="false">일자별</button>
+            </div>
+            <strong id="boardResultCount" class="board-result-count">전체 0건</strong>
+            <div id="boardResultSummary" class="board-result-summary"></div>
+          </div>
+          <section id="weatherAuditPanel" class="weather-audit-panel admin-only" aria-label="기상청 우천 검증 현황"></section>
           <div id="boardList" class="board-list"></div>
         </section>
 
@@ -123,18 +138,18 @@
               <span>타설부위</span>
               <input id="pourPartInput" type="text" placeholder="예: 금단교 A1(세종) 벽체 1단" autocomplete="off">
             </label>
-            <label>
-              <span>타설일</span>
+            <div class="field field-pour-date">
+              <label class="field-label" for="pourDateInput">타설일</label>
               <div class="date-stepper">
-                <button id="prevPourDateButton" class="date-step-button" type="button" title="타설일 하루 전">
+                <button id="prevPourDateButton" class="date-step-button" type="button" title="타설일 하루 전" aria-label="타설일 하루 전">
                   <span aria-hidden="true">‹</span>
                 </button>
                 <input id="pourDateInput" type="date">
-                <button id="nextPourDateButton" class="date-step-button" type="button" title="타설일 하루 후">
+                <button id="nextPourDateButton" class="date-step-button" type="button" title="타설일 하루 후" aria-label="타설일 하루 후">
                   <span aria-hidden="true">›</span>
                 </button>
               </div>
-            </label>
+            </div>
           </div>
 
           <div class="summary-row">
@@ -177,7 +192,7 @@
       </main>
     </div>
 
-    <div id="photoViewer" class="photo-viewer" hidden>
+    <div id="photoViewer" class="photo-viewer" role="dialog" aria-modal="true" aria-label="사진 크게 보기" tabindex="-1" hidden>
       <button id="photoViewerClose" class="photo-viewer-close" type="button" aria-label="닫기">×</button>
       <img id="photoViewerImage" alt="">
     </div>
@@ -212,6 +227,6 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
     <script src="./standards/search-index.js?v=20260703-2"></script>
-    <script src="./app.js?v=20260708-23"></script>
+    <script src="./app.js?v=20260723-3"></script>
   </body>
 </html>

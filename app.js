@@ -10,6 +10,15 @@ const TEMPERATURE_SLOT_LIST_STORAGE_KEY = "concrete-photo-board-ui:temperature-s
 const DAY_SLOT_EXTRA_HIDDEN_STORAGE_KEY = "concrete-photo-board-ui:day-slot-extra-hidden";
 const PRINT_DAY_LABEL_BLIND_STORAGE_KEY = "concrete-photo-board-ui:print-day-label-blind";
 const DAY_SLOT_LABELS_STORAGE_KEY = "concrete-photo-board-ui:day-slot-labels";
+const BOARD_SETTINGS_FALLBACK_PREFIX = "concrete-photo-board-ui:board-settings:";
+const STORAGE_CLEANUP_QUEUE_KEY = "concrete-photo-board-ui:storage-cleanup-queue";
+const BOARD_RESULT_PANEL_OPEN_STORAGE_KEY = "concrete-photo-board-ui:board-result-panel-open";
+const BOARD_RESULT_VIEW_STORAGE_KEY = "concrete-photo-board-ui:board-result-view";
+const BOARD_RESULT_VIEWS = {
+  ALL: "all",
+  MONTH: "month",
+  DAY: "day",
+};
 const PHOTO_TYPES = {
   CURING: "curing",
   TEMPERATURE: "temperature",
@@ -50,6 +59,11 @@ const SUPABASE_JS_URL = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45
 const HEIC2ANY_URL = "https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js";
 const JSPDF_URL = "https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js";
 const SCRIPT_LOAD_TIMEOUT_MS = 10000;
+const WEATHER_FUNCTION_NAME = "kma-weather";
+const WEATHER_STATION_ID = "494";
+const WEATHER_STATION_NAME = "세종고운 AWS";
+const WEATHER_STATION_DISTANCE_KM = 3.7;
+const WEATHER_REQUEST_TIMEOUT_MS = 12000;
 const STORAGE_DISPLAY_LIMIT_BYTES = 1024 * 1024 * 1024;
 const ESTIMATED_PHOTO_BYTES = 450 * 1024;
 const IMAGE_MAX_WIDTH = 1280;
@@ -105,6 +119,15 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
+function createDefaultBoardSettings() {
+  return {
+    daySlots: Array.from({ length: DEFAULT_DAY_SLOT_COUNT }, (_, index) => index + 1),
+    temperatureSlots: Array.from({ length: DEFAULT_TEMPERATURE_SLOT_COUNT }, (_, index) => index + 1),
+    extraDaySlotsHidden: false,
+    dayLabels: {},
+  };
+}
+
 const elements = {
   standardButton: document.getElementById("standardButton"),
   standardPanel: document.getElementById("standardPanel"),
@@ -126,6 +149,12 @@ const elements = {
   boardSearchBar: document.getElementById("boardSearchBar"),
   boardSearchInput: document.getElementById("boardSearchInput"),
   clearSearchButton: document.getElementById("clearSearchButton"),
+  boardResultToggleButton: document.getElementById("boardResultToggleButton"),
+  boardResultFilter: document.getElementById("boardResultFilter"),
+  boardResultViewButtons: Array.from(document.querySelectorAll("[data-board-result-view]")),
+  boardResultCount: document.getElementById("boardResultCount"),
+  boardResultSummary: document.getElementById("boardResultSummary"),
+  weatherAuditPanel: document.getElementById("weatherAuditPanel"),
   storageMeterText: document.getElementById("storageMeterText"),
   storageMeterBar: document.getElementById("storageMeterBar"),
   boardListSection: document.getElementById("boardListSection"),
@@ -150,12 +179,34 @@ const elements = {
 
 const config = window.CONCRETE_PHOTO_CONFIG || {};
 let dbClient = null;
+let weatherLoadState = "idle";
+let weatherLoadError = "";
+let weatherDailyByDate = new Map();
+let weatherFetchedAt = "";
+let weatherPersistenceAvailable = false;
+let weatherPersistenceMessage = "";
+let weatherLiveWarning = "";
+let weatherMismatchFilterActive = false;
 let realtimeChannel = null;
 let metaSaveTimer = null;
 let isMetaSaveInProgress = false;
+let metaSavePromise = null;
+let pendingMetaSaveOptions = null;
+let atomicPhotoRpcAvailable = null;
+let atomicDeleteMarkRpcAvailable = null;
+let atomicDeletePurgeRpcAvailable = null;
+let boardSettingsColumnAvailable = null;
+let boardSettingsSaveChain = Promise.resolve();
+let boardSettingsRevision = 0;
+let boardSettingsSaveCount = 0;
+let deletedBoardCleanupPromise = null;
+const deletedBoardCleanupRetryAt = new Map();
 let lastSyncedMeta = { projectName: "", pourPart: "", pourDate: "" };
 let boardList = [];
 let boardSearchQuery = "";
+let isBoardResultPanelOpen = loadBoardResultPanelOpen();
+let boardResultViewMode = loadBoardResultViewMode();
+let boardResultSelectedGroup = null;
 let boardListRenderFrame = 0;
 let isBoardSearchComposing = false;
 let isFilePickerOpen = false;
@@ -163,10 +214,12 @@ let filePickerClearTimer = null;
 let pendingRealtimeRefresh = false;
 let activePhotoMutationCount = 0;
 let boardLoadToken = 0;
+let entryLoadSequence = 0;
 let printPreviewRenderToken = 0;
 let printPreviewTimer = null;
 let activePhotoType = DEFAULT_PHOTO_TYPE;
 let pasteTargetDay = null;
+let lastPhotoViewerTrigger = null;
 let printImageCache = {
   signature: "",
   images: [],
@@ -186,6 +239,7 @@ let state = {
   pourDate: "",
   createdAt: "",
   entries: {},
+  settings: createDefaultBoardSettings(),
 };
 
 document.addEventListener("DOMContentLoaded", init);
@@ -210,6 +264,7 @@ async function init() {
   }
 
   renderAll();
+  loadWeatherData().catch(() => {});
 
   // 현장 통신이 약할 수 있어, PDF 생성용 라이브러리를 미리 받아둔다. (실패해도 무시)
   ensureJsPdf().catch(() => {});
@@ -248,6 +303,9 @@ function bindEvents() {
     window.setTimeout(handleBoardSearchInput, 0);
   });
   elements.clearSearchButton.addEventListener("click", clearBoardSearch);
+  elements.boardResultToggleButton?.addEventListener("click", toggleBoardResultPanel);
+  elements.boardResultFilter?.addEventListener("click", handleBoardResultFilterClick);
+  elements.weatherAuditPanel?.addEventListener("click", handleWeatherAuditClick);
   elements.boardListExpandButton?.addEventListener("click", toggleBoardListExpanded);
   elements.printButton.addEventListener("click", handlePrint);
   elements.newBoardButton.addEventListener("click", createNewBoard);
@@ -284,7 +342,6 @@ function bindEvents() {
     if (!button) return;
     openBoard(button.dataset.boardCode);
   });
-
   [elements.projectNameInput, elements.pourPartInput, elements.pourDateInput].forEach((input) => {
     input.addEventListener("input", () => {
       pullMetaFromInputs();
@@ -357,13 +414,13 @@ function bindEvents() {
 
     const addSlotButton = event.target.closest("[data-add-slot]");
     if (addSlotButton) {
-      addPhotoSlot(addSlotButton.dataset.addSlot || activePhotoType);
+      await addPhotoSlot(addSlotButton.dataset.addSlot || activePhotoType);
       return;
     }
 
     const renameButton = event.target.closest("[data-rename-day]");
     if (renameButton) {
-      renameDaySlot(Number(renameButton.dataset.renameDay));
+      await renameDaySlot(Number(renameButton.dataset.renameDay));
       return;
     }
 
@@ -469,8 +526,13 @@ function handleStandardPanelClick(event) {
 }
 
 function handleGlobalKeydown(event) {
-  if (!elements.photoViewer.hidden && event.key === "Escape") {
-    closePhotoViewer();
+  if (!elements.photoViewer.hidden) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closePhotoViewer();
+    } else if (event.key === "Tab") {
+      trapDialogFocus(elements.photoViewer, event);
+    }
     return;
   }
 
@@ -488,6 +550,26 @@ function handleGlobalKeydown(event) {
 
   if (event.key === "-") {
     adjustStandardDocumentZoom(-STANDARD_DOCUMENT_ZOOM_STEP);
+  }
+}
+
+function trapDialogFocus(container, event) {
+  const focusable = Array.from(
+    container.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')
+  ).filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+  if (!focusable.length) {
+    event.preventDefault();
+    container.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
   }
 }
 
@@ -831,6 +913,7 @@ async function setupCloudMode() {
   try {
     await ensureSupabaseClient();
     dbClient = window.supabase.createClient(config.supabaseUrl, config.supabaseAnonKey);
+    flushStorageCleanupQueue().catch(console.warn);
     if (state.shareCode) {
       const usedDraft = await loadCloudBoard();
       if (usedDraft) {
@@ -885,6 +968,7 @@ function resetCurrentBoard(options = {}) {
     pourDate: toDateInputValue(new Date()),
     createdAt: "",
     entries: {},
+    settings: createDefaultBoardSettings(),
   };
   lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
   syncInputsFromState();
@@ -901,6 +985,7 @@ function loadLocalBoard() {
     pourDate: toDateInputValue(new Date()),
     createdAt: "",
     entries: {},
+    settings: loadBoardSettingsFallback(shareCode) || getLegacyBoardSettings(),
   };
 
   if (saved) {
@@ -912,6 +997,9 @@ function loadLocalBoard() {
         shareCode,
         boardId: null,
         entries: normalizeEntries(parsed.entries || {}),
+        settings: normalizeBoardSettings(parsed.settings, {
+          fallback: loadBoardSettingsFallback(shareCode) || getLegacyBoardSettings(),
+        }),
       };
       state.projectName = normalizeProjectName(state.projectName);
     } catch (error) {
@@ -931,6 +1019,7 @@ function loadLocalBoard() {
 
 async function loadCloudBoard(options = {}) {
   const requestedShareCode = state.shareCode;
+  const requestedEntrySequence = ++entryLoadSequence;
   const shouldSyncInputs = options.syncInputs !== false;
   const createIfMissing = options.createIfMissing === true;
   if (loadHiddenBoardCodes().has(requestedShareCode)) {
@@ -960,18 +1049,32 @@ async function loadCloudBoard(options = {}) {
     state.pourPart = board.pour_part || "";
     state.pourDate = board.pour_date || toDateInputValue(new Date());
     state.createdAt = board.created_at || "";
+    state.settings = getBoardSettingsForRecord(board, requestedShareCode);
     lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
   } else if (createIfMissing) {
-    const { data: created, error: insertError } = await dbClient
+    const createPayload = {
+      share_code: requestedShareCode,
+      project_name: DEFAULT_PROJECT_NAME,
+      pour_part: "",
+      pour_date: toDateInputValue(new Date()),
+    };
+    if (boardSettingsColumnAvailable !== false) {
+      createPayload.settings = normalizeBoardSettings(state.settings);
+    }
+    let { data: created, error: insertError } = await dbClient
       .from("photo_boards")
-      .insert({
-        share_code: requestedShareCode,
-        project_name: DEFAULT_PROJECT_NAME,
-        pour_part: "",
-        pour_date: toDateInputValue(new Date()),
-      })
+      .insert(createPayload)
       .select("*")
       .single();
+    if (insertError && Object.prototype.hasOwnProperty.call(createPayload, "settings") && isMissingBackendFeature(insertError, "settings")) {
+      boardSettingsColumnAvailable = false;
+      delete createPayload.settings;
+      ({ data: created, error: insertError } = await dbClient
+        .from("photo_boards")
+        .insert(createPayload)
+        .select("*")
+        .single());
+    }
 
     if (insertError) throw insertError;
     if (state.shareCode !== requestedShareCode) return null;
@@ -981,6 +1084,7 @@ async function loadCloudBoard(options = {}) {
     state.pourPart = created.pour_part || "";
     state.pourDate = created.pour_date || toDateInputValue(new Date());
     state.createdAt = created.created_at || "";
+    state.settings = getBoardSettingsForRecord(created, requestedShareCode);
     lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
   } else {
     resetCurrentBoard({ keepShareCode: true });
@@ -990,7 +1094,7 @@ async function loadCloudBoard(options = {}) {
   if (!board && !createIfMissing) {
     clearMetaDraft();
   }
-  if (board?.photo_entries) {
+  if (board?.photo_entries && requestedEntrySequence === entryLoadSequence) {
     applyCloudEntries(board.photo_entries);
   } else {
     await loadCloudEntries();
@@ -1004,8 +1108,11 @@ async function loadCloudBoard(options = {}) {
 
 async function loadCloudEntries() {
   const requestedBoardId = state.boardId;
-  state.entries = {};
-  if (!requestedBoardId) return;
+  const requestedSequence = ++entryLoadSequence;
+  if (!requestedBoardId) {
+    state.entries = {};
+    return;
+  }
 
   const { data, error } = await dbClient
     .from("photo_entries")
@@ -1014,7 +1121,7 @@ async function loadCloudEntries() {
     .order("day_no", { ascending: true });
 
   if (error) throw error;
-  if (state.boardId !== requestedBoardId) return;
+  if (state.boardId !== requestedBoardId || requestedSequence !== entryLoadSequence) return;
 
   applyCloudEntries(data || []);
 }
@@ -1022,19 +1129,24 @@ async function loadCloudEntries() {
 function applyCloudEntries(entries) {
   state.entries = {};
   (entries || []).forEach((row) => {
-    const memo = parseEntryMemo(row.memo);
-    state.entries[row.day_no] = {
-      dayNo: row.day_no,
-      photoUrl: row.photo_url || "",
-      photoPath: row.photo_path || "",
-      uploadedAt: row.uploaded_at || "",
-      verifiedAt: memo.photos?.[PHOTO_TYPES.CURING]?.verifiedAt || row.uploaded_at || "",
-      capturedAt: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAt || "",
-      capturedAtSource: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAtSource || "",
-      rainHold: memo.rainHold,
-      photos: memo.photos || {},
-    };
+    state.entries[row.day_no] = cloudRowToEntry(row);
   });
+}
+
+function cloudRowToEntry(row) {
+  const memo = parseEntryMemo(row?.memo);
+  return {
+    dayNo: Number(row?.day_no || 0),
+    photoUrl: row?.photo_url || "",
+    photoPath: row?.photo_path || "",
+    uploadedAt: row?.uploaded_at || "",
+    verifiedAt: memo.photos?.[PHOTO_TYPES.CURING]?.verifiedAt || "",
+    verifiedAtSource: memo.photos?.[PHOTO_TYPES.CURING]?.verifiedAtSource || "",
+    capturedAt: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAt || "",
+    capturedAtSource: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAtSource || "",
+    rainHold: memo.rainHold,
+    photos: memo.photos || {},
+  };
 }
 
 async function loadBoardList() {
@@ -1069,24 +1181,31 @@ function saveHiddenBoardCode(shareCode) {
 function isDeletedBoardRecord(board) {
   const projectName = board?.project_name ?? board?.projectName ?? "";
   const pourPart = board?.pour_part ?? board?.pourPart ?? "";
-  return projectName === DELETED_BOARD_PROJECT_NAME || String(pourPart).startsWith(DELETED_BOARD_LABEL);
+  const deletedAt = board?.deleted_at ?? board?.deletedAt ?? "";
+  return Boolean(deletedAt) || projectName === DELETED_BOARD_PROJECT_NAME || String(pourPart).startsWith(DELETED_BOARD_LABEL);
 }
 
 async function loadCloudBoardList() {
   const hiddenBoardCodes = loadHiddenBoardCodes();
-  const { data, error } = await dbClient
-    .from("photo_boards")
-    .select("id, share_code, project_name, pour_part, pour_date, created_at, updated_at, photo_entries(day_no, photo_url, memo)")
-    .not("pour_date", "is", null)
-    .order("pour_date", { ascending: false })
-    .order("created_at", { ascending: false });
+  let { data, error } = await fetchCloudBoardListRows(boardSettingsColumnAvailable !== false);
+  if (error && boardSettingsColumnAvailable !== false && (
+    isMissingBackendFeature(error, "settings") || isMissingBackendFeature(error, "deleted_at")
+  )) {
+    boardSettingsColumnAvailable = false;
+    ({ data, error } = await fetchCloudBoardListRows(false));
+  }
   if (error) throw error;
+  if (boardSettingsColumnAvailable !== false) boardSettingsColumnAvailable = true;
+
+  const deletedBoards = (data || []).filter(isDeletedBoardRecord);
+  scheduleDeletedBoardCleanup(deletedBoards);
 
   boardList = (data || []).filter((board) => {
-    return board.share_code && !hiddenBoardCodes.has(board.share_code) && !isDeletedBoardRecord(board);
+    return board.share_code && board.pour_date && !hiddenBoardCodes.has(board.share_code) && !isDeletedBoardRecord(board);
   }).map((board) => {
     const pourPart = board.pour_part || "미입력";
     const entries = board.photo_entries || [];
+    const settings = getBoardSettingsForRecord(board, board.share_code);
     return {
       boardId: board.id,
       shareCode: board.share_code,
@@ -1097,10 +1216,52 @@ async function loadCloudBoardList() {
       createdAt: board.created_at || "",
       updatedAt: board.updated_at || "",
       entries,
-      completedCount: countCompletedEntries(entries, PHOTO_TYPES.CURING),
+      settings,
+      completedCount: countCompletedEntries(entries, PHOTO_TYPES.CURING, null, { pourDate: board.pour_date || "" }),
       temperatureCount: countCompletedEntries(entries, PHOTO_TYPES.TEMPERATURE),
       photoCount: countPhotoEntries(entries),
     };
+  });
+}
+
+async function fetchCloudBoardListRows(includeExtendedColumns) {
+  const columns = includeExtendedColumns
+    ? "id, share_code, project_name, pour_part, pour_date, created_at, updated_at, settings, deleted_at, photo_entries(day_no, photo_url, photo_path, memo)"
+    : "id, share_code, project_name, pour_part, pour_date, created_at, updated_at, photo_entries(day_no, photo_url, photo_path, memo)";
+  return dbClient
+    .from("photo_boards")
+    .select(columns)
+    .order("pour_date", { ascending: false })
+    .order("created_at", { ascending: false });
+}
+
+function scheduleDeletedBoardCleanup(boards) {
+  if (!dbClient || deletedBoardCleanupPromise || !boards?.length) return;
+  const now = Date.now();
+  const targets = boards
+    .filter((board) => now >= Number(deletedBoardCleanupRetryAt.get(board.id) || 0))
+    .map((board) => ({
+      boardId: board.id,
+      shareCode: board.share_code || "",
+      entries: board.photo_entries || [],
+    }));
+  if (!targets.length) return;
+
+  deletedBoardCleanupPromise = (async () => {
+    for (const target of targets) {
+      try {
+        const result = await deleteCloudBoardTarget(target);
+        if (!result.deleted || result.cleanupPending || result.status === "unknown") {
+          throw new Error("Deleted board cleanup remains pending.");
+        }
+        deletedBoardCleanupRetryAt.delete(target.boardId);
+      } catch (error) {
+        deletedBoardCleanupRetryAt.set(target.boardId, Date.now() + 5 * 60 * 1000);
+        console.warn("Deleted board cleanup will be retried later", error);
+      }
+    }
+  })().finally(() => {
+    deletedBoardCleanupPromise = null;
   });
 }
 
@@ -1113,8 +1274,12 @@ function loadLocalBoardList() {
         const parsed = JSON.parse(localStorage.getItem(key) || "{}");
         const entries = parsed.entries || {};
         const pourPart = parsed.pourPart || "미입력";
+        const shareCode = key.slice(LOCAL_PREFIX.length);
+        const settings = normalizeBoardSettings(parsed.settings, {
+          fallback: loadBoardSettingsFallback(shareCode) || getLegacyBoardSettings(),
+        });
         return {
-          shareCode: key.slice(LOCAL_PREFIX.length),
+          shareCode,
           projectName: normalizeProjectName(parsed.projectName || DEFAULT_PROJECT_NAME),
           pourPart,
           searchText: normalizeSearchText(pourPart),
@@ -1122,7 +1287,8 @@ function loadLocalBoardList() {
           createdAt: parsed.createdAt || parsed.updatedAt || "",
           updatedAt: parsed.updatedAt || "",
           entries,
-          completedCount: countCompletedEntries(entries, PHOTO_TYPES.CURING),
+          settings,
+          completedCount: countCompletedEntries(entries, PHOTO_TYPES.CURING, null, { pourDate: parsed.pourDate || "" }),
           temperatureCount: countCompletedEntries(entries, PHOTO_TYPES.TEMPERATURE),
           photoCount: countPhotoEntries(entries),
         };
@@ -1145,7 +1311,7 @@ async function reconcileCurrentBoardEntries() {
   const current = boardList.find((board) => board.shareCode === state.shareCode);
   if (!current) return;
 
-  const detailCount = countCompletedEntries(state.entries || {}, PHOTO_TYPES.CURING);
+  const detailCount = countCompletedEntries(state.entries || {}, PHOTO_TYPES.CURING, null, { pourDate: state.pourDate });
   const detailPhotoCount = countPhotoEntries(state.entries || {});
   const listCount = Number(current.completedCount || 0);
   const listPhotoCount = Number(current.photoCount ?? current.completedCount ?? 0);
@@ -1168,6 +1334,7 @@ async function shiftPourDate(offset) {
   elements.pourDateInput.value = toDateInputValue(next);
   pullMetaFromInputs();
   await saveMeta();
+  boardResultSelectedGroup = null;
   renderAll();
 }
 
@@ -1263,10 +1430,48 @@ function flushMetaSave(options = {}) {
   saveMeta({ ...options, allowConfirm: options.silent ? false : options.allowConfirm !== false }).catch(console.error);
 }
 
-async function saveMeta(options = {}) {
+function saveMeta(options = {}) {
+  const incoming = normalizeMetaSaveOptions(options);
+  pendingMetaSaveOptions = pendingMetaSaveOptions
+    ? {
+        silent: pendingMetaSaveOptions.silent && incoming.silent,
+        allowConfirm: pendingMetaSaveOptions.allowConfirm || incoming.allowConfirm,
+      }
+    : incoming;
+
+  if (metaSavePromise) return metaSavePromise;
+
+  metaSavePromise = (async () => {
+    while (pendingMetaSaveOptions) {
+      const nextOptions = pendingMetaSaveOptions;
+      pendingMetaSaveOptions = null;
+      try {
+        await saveMetaOnce(nextOptions);
+      } catch (error) {
+        console.error(error);
+        showToast("사진대지 정보 저장에 실패했습니다. 잠시 뒤 다시 시도해 주세요.");
+      }
+    }
+  })().finally(async () => {
+    metaSavePromise = null;
+    isMetaSaveInProgress = false;
+    await flushPendingRealtimeRefresh();
+  });
+
+  return metaSavePromise;
+}
+
+function normalizeMetaSaveOptions(options = {}) {
+  const silent = options.silent === true;
+  return {
+    silent,
+    allowConfirm: !silent && options.allowConfirm !== false,
+  };
+}
+
+async function saveMetaOnce(options = {}) {
   const silent = options.silent === true;
   const allowConfirm = options.allowConfirm !== false && !silent;
-  if (isMetaSaveInProgress) return;
   isMetaSaveInProgress = true;
 
   try {
@@ -1281,78 +1486,136 @@ async function saveMeta(options = {}) {
   if (!state.shareCode) return;
   if (dbClient && !state.boardId) return;
 
-  const hasMetaChange =
-    state.projectName !== lastSyncedMeta.projectName ||
-    state.pourPart !== lastSyncedMeta.pourPart ||
-    state.pourDate !== lastSyncedMeta.pourDate;
+  const saveContext = {
+    shareCode: state.shareCode,
+    boardId: state.boardId,
+    projectName: state.projectName,
+    pourPart: state.pourPart,
+    pourDate: state.pourDate,
+  };
+  const syncedAtStart = { ...lastSyncedMeta };
+
+  const dirtyFields = {
+    projectName: saveContext.projectName !== syncedAtStart.projectName,
+    pourPart: saveContext.pourPart !== syncedAtStart.pourPart,
+    pourDate: saveContext.pourDate !== syncedAtStart.pourDate,
+  };
+  const hasMetaChange = Object.values(dirtyFields).some(Boolean);
   if (!hasMetaChange) return;
 
-  if (countPhotoEntries(state.entries || {}) > 0 && metaChangedFromSynced()) {
+  if (countPhotoEntries(state.entries || {}) > 0 && metaChangedFromSynced(saveContext, syncedAtStart)) {
     if (!allowConfirm) return;
     const ok = window.confirm(
-      `이미 사진이 등록된 대지입니다.\n\n${describeMetaChange()}\n\n이대로 저장할까요?`
+      `이미 사진이 등록된 대지입니다.\n\n${describeMetaChange(saveContext, syncedAtStart)}\n\n이대로 저장할까요?`
     );
     if (!ok) {
-      revertMetaInputsToSynced();
-      clearMetaDraft();
-      renderMetaPreview();
+      if (isCurrentBoard(saveContext)) {
+        revertMetaInputsToSynced(syncedAtStart);
+        clearMetaDraftIfMatches(saveContext.shareCode, saveContext);
+        renderMetaPreview();
+      }
       return;
     }
   }
 
-  if (dbClient && state.boardId) {
-    const { error } = await dbClient
+  if (dbClient && saveContext.boardId) {
+    const updatePayload = {};
+    if (dirtyFields.projectName) updatePayload.project_name = saveContext.projectName;
+    if (dirtyFields.pourPart) updatePayload.pour_part = saveContext.pourPart;
+    if (dirtyFields.pourDate) updatePayload.pour_date = saveContext.pourDate || null;
+    const { data: savedBoard, error } = await dbClient
       .from("photo_boards")
-      .update({
-        project_name: state.projectName,
-        pour_part: state.pourPart,
-        pour_date: state.pourDate || null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", state.boardId);
+      .update(updatePayload)
+      .eq("id", saveContext.boardId)
+      .select("project_name, pour_part, pour_date, updated_at")
+      .maybeSingle();
 
-    if (error) {
+    if (error || !savedBoard) {
       console.error(error);
       showToast("사진대지 정보 저장에 실패했습니다.");
       return;
     }
 
-    clearMetaDraft();
-    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
-    await loadBoardList();
+    const savedMeta = {
+      projectName: normalizeProjectName(savedBoard.project_name || DEFAULT_PROJECT_NAME),
+      pourPart: savedBoard.pour_part || "",
+      pourDate: savedBoard.pour_date || saveContext.pourDate,
+    };
+    clearMetaDraftIfMatches(saveContext.shareCode, saveContext);
+    if (isCurrentBoard(saveContext)) {
+      applySavedMetaResponse(saveContext, syncedAtStart, savedMeta, dirtyFields);
+      lastSyncedMeta = savedMeta;
+    }
+    try {
+      await loadBoardList();
+    } catch (refreshError) {
+      console.warn("Saved board list refresh failed", refreshError);
+      pendingRealtimeRefresh = true;
+    }
     renderBoardList();
     renderStorageMeter();
   } else {
     saveLocalBoard();
-    clearMetaDraft();
-    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
-    await loadBoardList();
+    clearMetaDraftIfMatches(saveContext.shareCode, saveContext);
+    if (isCurrentBoard(saveContext)) {
+      lastSyncedMeta = {
+        projectName: saveContext.projectName,
+        pourPart: saveContext.pourPart,
+        pourDate: saveContext.pourDate,
+      };
+    }
+    try {
+      await loadBoardList();
+    } catch (refreshError) {
+      console.warn("Saved local board list refresh failed", refreshError);
+    }
     renderBoardList();
     renderStorageMeter();
   }
   } finally {
-    isMetaSaveInProgress = false;
+    // saveMeta()의 큐 루프가 후속 변경을 이어서 저장한 뒤 플래그를 해제합니다.
   }
 }
 
-function metaChangedFromSynced() {
-  return state.pourPart !== lastSyncedMeta.pourPart || state.pourDate !== lastSyncedMeta.pourDate;
+function applySavedMetaResponse(saveContext, syncedAtStart, savedMeta, dirtyFields) {
+  const fields = [
+    ["projectName", elements.projectNameInput],
+    ["pourPart", elements.pourPartInput],
+    ["pourDate", elements.pourDateInput],
+  ];
+  fields.forEach(([field, input]) => {
+    const expectedCurrent = dirtyFields[field] ? saveContext[field] : syncedAtStart[field];
+    const currentValue = field === "projectName"
+      ? normalizeProjectName(input.value || DEFAULT_PROJECT_NAME)
+      : String(input.value || "");
+    if (currentValue !== String(expectedCurrent || "")) return;
+    state[field] = savedMeta[field];
+    input.value = savedMeta[field];
+  });
 }
 
-function describeMetaChange() {
+function isCurrentBoard(context) {
+  return state.shareCode === context.shareCode && state.boardId === context.boardId;
+}
+
+function metaChangedFromSynced(meta = state, synced = lastSyncedMeta) {
+  return meta.pourPart !== synced.pourPart || meta.pourDate !== synced.pourDate;
+}
+
+function describeMetaChange(meta = state, synced = lastSyncedMeta) {
   const lines = [];
-  if (state.pourPart !== lastSyncedMeta.pourPart) {
-    lines.push(`타설부위: ${lastSyncedMeta.pourPart || "(미입력)"} → ${state.pourPart || "(미입력)"}`);
+  if (meta.pourPart !== synced.pourPart) {
+    lines.push(`타설부위: ${synced.pourPart || "(미입력)"} → ${meta.pourPart || "(미입력)"}`);
   }
-  if (state.pourDate !== lastSyncedMeta.pourDate) {
-    lines.push(`타설일: ${lastSyncedMeta.pourDate || "(미입력)"} → ${state.pourDate || "(미입력)"}`);
+  if (meta.pourDate !== synced.pourDate) {
+    lines.push(`타설일: ${synced.pourDate || "(미입력)"} → ${meta.pourDate || "(미입력)"}`);
   }
   return lines.join("\n");
 }
 
-function revertMetaInputsToSynced() {
-  state.pourPart = lastSyncedMeta.pourPart;
-  state.pourDate = lastSyncedMeta.pourDate;
+function revertMetaInputsToSynced(synced = lastSyncedMeta) {
+  state.pourPart = synced.pourPart;
+  state.pourDate = synced.pourDate;
   elements.pourPartInput.value = state.pourPart;
   elements.pourDateInput.value = state.pourDate;
 }
@@ -1397,123 +1660,193 @@ function applyMetaDraft(remoteUpdatedAt) {
   }
 }
 
-function clearMetaDraft() {
+function clearMetaDraft(shareCode = state.shareCode) {
   try {
-    localStorage.removeItem(META_DRAFT_PREFIX + state.shareCode);
+    localStorage.removeItem(META_DRAFT_PREFIX + shareCode);
   } catch {
     // Ignore storage cleanup errors.
   }
 }
 
-async function saveEntry(day, photoType = activePhotoType) {
+function clearMetaDraftIfMatches(shareCode, meta) {
+  try {
+    const key = META_DRAFT_PREFIX + shareCode;
+    const saved = localStorage.getItem(key);
+    if (!saved) return;
+    const draft = JSON.parse(saved);
+    const matches =
+      normalizeProjectName(draft.projectName) === normalizeProjectName(meta.projectName) &&
+      String(draft.pourPart || "") === String(meta.pourPart || "") &&
+      String(draft.pourDate || "") === String(meta.pourDate || "");
+    if (matches) localStorage.removeItem(key);
+  } catch (error) {
+    console.warn("Meta draft cleanup failed", error);
+  }
+}
+
+async function saveEntry(day, photoType = activePhotoType, patch = null) {
   if (!state.shareCode || (dbClient && !state.boardId)) {
     showToast("새 대지를 먼저 만들어 주세요.");
     return false;
   }
 
-  const saved = await persistEntry(day, photoType);
+  const saved = await persistEntry(day, photoType, patch);
   if (!saved) return false;
 
-  await loadBoardList();
+  try {
+    await loadBoardList();
+  } catch (error) {
+    console.warn("Saved entry list refresh failed", error);
+    pendingRealtimeRefresh = Boolean(dbClient);
+  }
   renderAll();
   return true;
 }
 
-async function persistEntry(day, photoType = activePhotoType) {
+async function persistEntry(day, photoType = activePhotoType, patch = null) {
   const entry = getEntry(day);
   const normalizedType = normalizePhotoType(photoType);
   const slotLabel = getPhotoSlotLabel(day, normalizedType);
+  const previousPhoto = patch?.photo ? getTypedPhoto(entry, normalizedType) : null;
+  const previousRainHold = isRainHoldEntry(entry);
 
   if (dbClient && state.boardId) {
-    let existing = null;
-    try {
-      existing = await loadExistingCloudEntry(day);
-    } catch (error) {
-      console.error(error);
-      showToast(`${slotLabel} 기존 저장 정보를 확인하지 못했습니다. 잠시 뒤 다시 시도해 주세요.`);
-      return false;
+    const atomicResult = await persistEntryAtomically(day, normalizedType, entry, patch);
+    if (atomicResult.supported) {
+      if (patch) {
+        patch.usedAtomic = true;
+        patch.replacedPhotoPath = atomicResult.oldPhotoPath || "";
+        patch.keepNewPathOnFailure = atomicResult.cleanupSafe === false;
+      }
+      if (!atomicResult.saved) {
+        showToast(
+          atomicResult.backendUpgradeRequired
+            ? "서버 업데이트가 필요합니다. 관리자에게 데이터베이스 업데이트를 요청해 주세요."
+            : `${slotLabel} 저장에 실패했습니다.`,
+        );
+      }
+      return atomicResult.saved;
     }
-    const payload = createEntryPersistPayload(day, normalizedType, entry, existing);
-    const { error } = await dbClient
-      .from("photo_entries")
-      .upsert(
-        payload,
-        { onConflict: "board_id,day_no" }
-      );
-
-    if (error) {
-      console.error(error);
-      showToast(`${slotLabel} 저장에 실패했습니다.`);
-      return false;
-    }
+    return false;
   } else {
-    return saveLocalBoard();
+    if (patch?.photo) setTypedPhoto(entry, normalizedType, patch.photo);
+    if (typeof patch?.rainHold === "boolean") entry.rainHold = patch.rainHold;
+    const saved = saveLocalBoard();
+    if (!saved) restoreEntryPatch(entry, normalizedType, previousPhoto, previousRainHold, patch);
+    return saved;
   }
-
-  return true;
 }
 
-async function loadExistingCloudEntry(day) {
-  if (!dbClient || !state.boardId) return null;
-
-  const { data, error } = await dbClient
-    .from("photo_entries")
-    .select("photo_url, photo_path, uploaded_at, memo")
-    .eq("board_id", state.boardId)
-    .eq("day_no", day)
-    .maybeSingle();
-
-  if (error) throw error;
-
-  return data || null;
+function restoreEntryPatch(entry, photoType, previousPhoto, previousRainHold, patch) {
+  if (patch?.photo && previousPhoto) setTypedPhoto(entry, photoType, previousPhoto);
+  if (typeof patch?.rainHold === "boolean") entry.rainHold = previousRainHold;
 }
 
-function createEntryPersistPayload(day, photoType, entry, existing) {
-  const existingMemo = parseEntryMemo(existing?.memo);
-  const existingEntry = normalizeEntryShape({
-    dayNo: day,
-    photoUrl: existing?.photo_url || "",
-    photoPath: existing?.photo_path || "",
-    uploadedAt: existing?.uploaded_at || "",
-    verifiedAt: existingMemo.photos?.[PHOTO_TYPES.CURING]?.verifiedAt || existing?.uploaded_at || "",
-    capturedAt: existingMemo.photos?.[PHOTO_TYPES.CURING]?.capturedAt || "",
-    capturedAtSource: existingMemo.photos?.[PHOTO_TYPES.CURING]?.capturedAtSource || "",
-    rainHold: existingMemo.rainHold,
-    photos: existingMemo.photos || {},
-  });
-
-  const merged = normalizeEntryShape({
-    ...existingEntry,
-    ...entry,
-    photos: {
-      ...(existingEntry.photos || {}),
-      ...(entry.photos || {}),
-    },
-  });
-
-  if (photoType !== PHOTO_TYPES.CURING) {
-    merged.photoUrl = existingEntry.photoUrl || entry.photoUrl || "";
-    merged.photoPath = existingEntry.photoPath || entry.photoPath || "";
-    merged.uploadedAt = existingEntry.uploadedAt || entry.uploadedAt || "";
-    merged.verifiedAt = existingEntry.verifiedAt || entry.verifiedAt || "";
-    merged.capturedAt = existingEntry.capturedAt || entry.capturedAt || "";
-    merged.capturedAtSource = existingEntry.capturedAtSource || entry.capturedAtSource || "";
-    merged.rainHold = existingEntry.rainHold || entry.rainHold || false;
+async function persistEntryAtomically(day, photoType, entry, patch = null) {
+  if (!dbClient || !state.boardId) {
+    return { supported: false, saved: false };
+  }
+  if (atomicPhotoRpcAvailable === false) {
+    return { supported: true, saved: false, backendUpgradeRequired: true, cleanupSafe: true };
   }
 
-  if (photoType === PHOTO_TYPES.CURING && existingEntry.photos?.[PHOTO_TYPES.TEMPERATURE]) {
-    merged.photos[PHOTO_TYPES.TEMPERATURE] = existingEntry.photos[PHOTO_TYPES.TEMPERATURE];
+  const requestedBoardId = state.boardId;
+  const photo = patch?.photo || getTypedPhoto(entry, photoType);
+  const rainHold = typeof patch?.rainHold === "boolean" ? patch.rainHold : isRainHoldEntry(entry);
+  let data = null;
+  let error = null;
+  try {
+    ({ data, error } = await dbClient.rpc("save_photo_entry_atomic", {
+      p_board_id: requestedBoardId,
+      p_day_no: Number(day),
+      p_photo_type: photoType,
+      p_photo_url: photo.photoUrl || null,
+      p_photo_path: photo.photoPath || null,
+      p_size_bytes: Number(photo.sizeBytes || 0),
+      p_captured_at: photo.capturedAt || null,
+      p_captured_at_source: photo.capturedAtSource || null,
+      p_rain_hold: rainHold,
+      p_mutate_photo: Boolean(patch?.photo),
+    }));
+  } catch (requestError) {
+    error = requestError;
   }
 
+  if (error) {
+    if (isMissingBackendFeature(error, "save_photo_entry_atomic")) {
+      atomicPhotoRpcAvailable = false;
+      console.warn("Atomic photo save RPC is unavailable; cloud writes are paused until the server is updated.");
+      return { supported: true, saved: false, backendUpgradeRequired: true, cleanupSafe: true };
+    }
+
+    atomicPhotoRpcAvailable = true;
+    console.error(error);
+    const verification = await verifyCloudEntryWrite(day, requestedBoardId, photoType, patch);
+    return {
+      supported: true,
+      saved: verification.confirmed,
+      oldPhotoPath: "",
+      cleanupSafe: verification.cleanupSafe,
+    };
+  }
+
+  atomicPhotoRpcAvailable = true;
+  const result = Array.isArray(data) ? data[0] : data;
+  const row = result?.entry || result;
+  if (!row) return { supported: true, saved: false };
+  if (state.boardId === requestedBoardId) {
+    state.entries[Number(row.day_no || day)] = cloudRowToEntry(row);
+  }
   return {
-    board_id: state.boardId,
-    day_no: day,
-    photo_url: merged.photoUrl || null,
-    photo_path: merged.photoPath || null,
-    uploaded_at: merged.uploadedAt || null,
-    memo: serializeEntryMemo(merged),
-    updated_at: new Date().toISOString(),
+    supported: true,
+    saved: true,
+    oldPhotoPath: result?.old_photo_path || "",
+    cleanupSafe: true,
   };
+}
+
+async function verifyCloudEntryWrite(day, boardId, photoType, patch) {
+  if (!dbClient || !boardId || !patch) return { confirmed: false, cleanupSafe: false };
+  try {
+    const { data: row, error } = await dbClient
+      .from("photo_entries")
+      .select("*")
+      .eq("board_id", boardId)
+      .eq("day_no", day)
+      .maybeSingle();
+    if (error) throw error;
+    if (!row) {
+      const expectedDelete = Boolean(patch.photo) && !patch.photo.photoUrl && !patch.photo.photoPath;
+      return { confirmed: expectedDelete, cleanupSafe: true };
+    }
+
+    const savedEntry = cloudRowToEntry(row);
+    const actualPhoto = getTypedPhoto(savedEntry, photoType);
+    const photoMatches = !patch.photo || (
+      String(actualPhoto.photoPath || "") === String(patch.photo.photoPath || "") &&
+      String(actualPhoto.photoUrl || "") === String(patch.photo.photoUrl || "")
+    );
+    const rainMatches = typeof patch.rainHold !== "boolean" || isRainHoldEntry(savedEntry) === patch.rainHold;
+    const confirmed = photoMatches && rainMatches;
+    if (confirmed && state.boardId === boardId) {
+      state.entries[Number(row.day_no || day)] = savedEntry;
+    }
+    return { confirmed, cleanupSafe: true };
+  } catch (error) {
+    console.warn("Photo save result could not be verified", error);
+    return { confirmed: false, cleanupSafe: false };
+  }
+}
+
+function isMissingBackendFeature(error, featureName = "") {
+  const code = String(error?.code || "");
+  const message = `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`;
+  return (
+    code === "PGRST202" ||
+    code === "PGRST204" ||
+    code === "42883" ||
+    (featureName && message.includes(featureName) && /not find|does not exist|schema cache/i.test(message))
+  );
 }
 
 function saveLocalBoard() {
@@ -1529,6 +1862,7 @@ function saveLocalBoard() {
         createdAt: state.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         entries: normalizeEntries(state.entries),
+        settings: normalizeBoardSettings(state.settings),
       })
     );
     renderStorageMeter();
@@ -1555,19 +1889,33 @@ async function handlePhotoUpload(photoType, day, file) {
   }
 
   beginPhotoMutation();
+  let image = null;
+  let committed = false;
+  let photoPatch = null;
   try {
     showToast(`${slotLabel} ${typeConfig.label} 사진을 압축하는 중입니다.`);
-    const image = await preparePhotoEntry(normalizedType, day, file);
-    const saved = await saveEntry(day, normalizedType);
+    image = await preparePhotoEntry(normalizedType, day, file);
+    const entry = getEntry(day);
+    const patch = photoPatch = {
+      photo: image.nextPhoto,
+      rainHold: normalizedType === PHOTO_TYPES.CURING ? false : isRainHoldEntry(entry),
+    };
+    const saved = await saveEntry(day, normalizedType, patch);
     if (!saved) {
-      setTypedPhoto(getEntry(day), normalizedType, image.previousPhoto);
-      cleanupNewPhotoPath(image.newPath);
+      if (!patch.keepNewPathOnFailure) await cleanupNewPhotoPath(image.newPath);
       return false;
     }
-    cleanupOldPhotoPath(image.oldPath, image.newPath);
+    committed = true;
+    await cleanupOldPhotoPath(
+      patch.usedAtomic ? (patch.replacedPhotoPath || image.oldPath) : image.oldPath,
+      image.newPath,
+    );
     return true;
   } catch (error) {
     console.error(error);
+    if (image?.newPath && !committed && !photoPatch?.keepNewPathOnFailure) {
+      await cleanupNewPhotoPath(image.newPath);
+    }
     showToast("사진 등록에 실패했습니다. 다른 사진이나 JPG 사진으로 다시 시도해 주세요.");
     return false;
   } finally {
@@ -1618,26 +1966,44 @@ async function handlePhotoSelection(photoType, startDay, files) {
       while (!savedForDay && fileIndex < imageFiles.length) {
         const file = imageFiles[fileIndex];
         fileIndex += 1;
+        let image = null;
+        let committed = false;
+        let photoPatch = null;
 
         try {
-          const image = await preparePhotoEntry(normalizedType, day, file);
-          const saved = await persistEntry(day, normalizedType);
+          image = await preparePhotoEntry(normalizedType, day, file);
+          const entry = getEntry(day);
+          const patch = photoPatch = {
+            photo: image.nextPhoto,
+            rainHold: normalizedType === PHOTO_TYPES.CURING ? false : isRainHoldEntry(entry),
+          };
+          const saved = await persistEntry(day, normalizedType, patch);
           if (!saved) {
-            setTypedPhoto(getEntry(day), normalizedType, image.previousPhoto);
-            cleanupNewPhotoPath(image.newPath);
             throw new Error(`${getPhotoSlotLabel(day, normalizedType)} 저장 실패`);
           }
-          cleanupOldPhotoPath(image.oldPath, image.newPath);
+          committed = true;
+          await cleanupOldPhotoPath(
+            patch.usedAtomic ? (patch.replacedPhotoPath || image.oldPath) : image.oldPath,
+            image.newPath,
+          );
           completed += 1;
           savedForDay = true;
         } catch (error) {
           console.error(error);
+          if (image?.newPath && !committed && !photoPatch?.keepNewPathOnFailure) {
+            await cleanupNewPhotoPath(image.newPath);
+          }
           failed += 1;
         }
       }
     }
 
-    await loadBoardList();
+    try {
+      await loadBoardList();
+    } catch (error) {
+      console.warn("Saved entries list refresh failed", error);
+      pendingRealtimeRefresh = Boolean(dbClient);
+    }
     renderAll();
 
     const overflowCount = Math.max(0, imageFiles.length - targetDays.length - failed);
@@ -1661,6 +2027,11 @@ async function handlePhotoSelection(photoType, startDay, files) {
 
 async function preparePhotoEntry(photoType, day, file) {
   const normalizedType = normalizePhotoType(photoType);
+  const uploadContext = {
+    client: dbClient,
+    boardId: state.boardId,
+    shareCode: state.shareCode,
+  };
   const uploadFile = await prepareImageFile(file);
   const image = await resizeImage(uploadFile);
   const entry = getEntry(day);
@@ -1672,34 +2043,47 @@ async function preparePhotoEntry(photoType, day, file) {
     photoUrl: image.dataUrl,
     photoPath: "",
     uploadedAt,
-    verifiedAt: uploadedAt,
+    verifiedAt: dbClient ? "" : uploadedAt,
+    verifiedAtSource: dbClient ? "" : "device",
     capturedAt: "",
     capturedAtSource: "",
     sizeBytes: image.blob.size,
   };
-  setTypedPhoto(entry, normalizedType, nextPhoto);
-  if (normalizedType === PHOTO_TYPES.CURING) {
-    entry.rainHold = false;
-  }
 
-  if (dbClient && state.boardId) {
-    const path = `${state.shareCode}/${normalizedType}/day-${day}-${Date.now()}.jpg`;
-    const { error: uploadError } = await dbClient.storage
-      .from(config.bucket)
-      .upload(path, image.blob, {
-        contentType: "image/jpeg",
-        upsert: true,
-      });
+  if (uploadContext.client && uploadContext.boardId) {
+    if (state.boardId !== uploadContext.boardId || state.shareCode !== uploadContext.shareCode) {
+      throw new Error("Photo board changed while preparing the upload.");
+    }
+    const objectId = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const path = `${uploadContext.shareCode}/${normalizedType}/day-${day}-${objectId}.jpg`;
+    let uploadError = null;
+    try {
+      ({ error: uploadError } = await uploadContext.client.storage
+        .from(config.bucket)
+        .upload(path, image.blob, {
+          contentType: "image/jpeg",
+          upsert: false,
+        }));
+    } catch (requestError) {
+      uploadError = requestError;
+    }
 
-    if (uploadError) throw uploadError;
-
-    const { data } = dbClient.storage.from(config.bucket).getPublicUrl(path);
-    setTypedPhoto(entry, normalizedType, {
-      ...nextPhoto,
-      photoUrl: data.publicUrl,
-      photoPath: path,
-    });
+    if (uploadError) {
+      await uploadContext.client.storage.from(config.bucket).remove([path]).catch(() => {});
+      throw uploadError;
+    }
     newPath = path;
+    try {
+      const { data } = uploadContext.client.storage.from(config.bucket).getPublicUrl(path);
+      if (!data?.publicUrl) throw new Error("Uploaded photo URL is unavailable.");
+      Object.assign(nextPhoto, {
+        photoUrl: data.publicUrl,
+        photoPath: path,
+      });
+    } catch (error) {
+      await uploadContext.client.storage.from(config.bucket).remove([path]).catch(console.error);
+      throw error;
+    }
   }
 
   return {
@@ -1707,18 +2091,66 @@ async function preparePhotoEntry(photoType, day, file) {
     oldPath,
     newPath,
     previousPhoto,
+    nextPhoto,
   };
 }
 
-function cleanupOldPhotoPath(oldPath, newPath) {
-  if (dbClient && oldPath && oldPath !== newPath) {
-    dbClient.storage.from(config.bucket).remove([oldPath]).catch(console.error);
+async function cleanupOldPhotoPath(oldPath, newPath) {
+  if (!dbClient || !oldPath || oldPath === newPath) return;
+  try {
+    const { error } = await dbClient.storage.from(config.bucket).remove([oldPath]);
+    if (error) {
+      queueStorageCleanupPath(oldPath);
+      console.warn("Replaced photo storage cleanup failed", error);
+    }
+  } catch (error) {
+    queueStorageCleanupPath(oldPath);
+    console.warn("Replaced photo storage cleanup failed", error);
   }
 }
 
-function cleanupNewPhotoPath(newPath) {
-  if (dbClient && newPath) {
-    dbClient.storage.from(config.bucket).remove([newPath]).catch(console.error);
+async function cleanupNewPhotoPath(newPath) {
+  if (!dbClient || !newPath) return;
+  try {
+    const { error } = await dbClient.storage.from(config.bucket).remove([newPath]);
+    if (error) {
+      queueStorageCleanupPath(newPath);
+      console.warn("Failed photo upload cleanup failed", error);
+    }
+  } catch (error) {
+    queueStorageCleanupPath(newPath);
+    console.warn("Failed photo upload cleanup failed", error);
+  }
+}
+
+function queueStorageCleanupPath(path) {
+  if (!path) return;
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_CLEANUP_QUEUE_KEY) || "[]");
+    const paths = new Set(Array.isArray(saved) ? saved.filter(Boolean).map(String) : []);
+    paths.add(String(path));
+    localStorage.setItem(STORAGE_CLEANUP_QUEUE_KEY, JSON.stringify(Array.from(paths).slice(-500)));
+  } catch {
+    // 재시도 목록 저장 실패는 원래 사진 저장 결과를 되돌리지 않습니다.
+  }
+}
+
+async function flushStorageCleanupQueue() {
+  if (!dbClient) return;
+  let paths = [];
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_CLEANUP_QUEUE_KEY) || "[]");
+    paths = Array.isArray(saved) ? Array.from(new Set(saved.filter(Boolean).map(String))) : [];
+  } catch {
+    return;
+  }
+  if (!paths.length) return;
+  const { error } = await dbClient.storage.from(config.bucket).remove(paths);
+  if (error) throw error;
+  try {
+    localStorage.removeItem(STORAGE_CLEANUP_QUEUE_KEY);
+  } catch {
+    // 이미 파일은 정리됐으므로 다음 재시도에서 같은 경로 삭제를 반복해도 안전합니다.
   }
 }
 
@@ -1728,29 +2160,40 @@ async function deletePhoto(photoType, day, { skipConfirm = false } = {}) {
   const slotLabel = getPhotoSlotLabel(day, normalizedType);
   const entry = getEntry(day);
   const previousPhoto = getTypedPhoto(entry, normalizedType);
-  if (!previousPhoto.photoUrl) return;
+  if (!previousPhoto.photoUrl) return true;
   if (!skipConfirm) {
     const ok = window.confirm(`${slotLabel} ${typeConfig.label} 사진을 삭제할까요?`);
-    if (!ok) return;
+    if (!ok) return false;
   }
 
   endFilePickNow();
   beginPhotoMutation();
-  clearTypedPhoto(entry, normalizedType);
-  renderAll();
 
   try {
-    const saved = await saveEntry(day, normalizedType);
+    const patch = {
+      photo: {
+        photoUrl: "",
+        photoPath: "",
+        uploadedAt: "",
+        verifiedAt: "",
+        verifiedAtSource: "",
+        capturedAt: "",
+        capturedAtSource: "",
+        sizeBytes: 0,
+      },
+      rainHold: isRainHoldEntry(entry),
+    };
+    const saved = await saveEntry(day, normalizedType, patch);
     if (!saved) {
-      setTypedPhoto(entry, normalizedType, previousPhoto);
-      renderAll();
       showToast(`${slotLabel} ${typeConfig.label} 사진 삭제 저장에 실패했습니다.`);
-      return;
+      return false;
     }
 
-    if (dbClient && previousPhoto.photoPath) {
-      dbClient.storage.from(config.bucket).remove([previousPhoto.photoPath]).catch(console.error);
-    }
+    const removedPath = patch.usedAtomic
+      ? (patch.replacedPhotoPath || previousPhoto.photoPath)
+      : previousPhoto.photoPath;
+    await cleanupOldPhotoPath(removedPath, "");
+    return true;
   } finally {
     await endPhotoMutation();
   }
@@ -1770,15 +2213,14 @@ async function toggleRainHold(day) {
     return;
   }
 
-  entry.rainHold = !previousRainHold;
-  renderAll();
-
-  const saved = await saveEntry(day, PHOTO_TYPES.CURING);
-  if (!saved) {
-    entry.rainHold = previousRainHold;
-    renderAll();
-    showToast(`${day}일차 우천 설정 저장에 실패했습니다.`);
-    return;
+  beginPhotoMutation();
+  try {
+    const saved = await saveEntry(day, PHOTO_TYPES.CURING, { rainHold: !previousRainHold });
+    if (!saved) {
+      showToast(`${day}일차 우천 설정 저장에 실패했습니다.`);
+    }
+  } finally {
+    await endPhotoMutation();
   }
 }
 
@@ -1841,6 +2283,10 @@ function setActivePhotoType(photoType) {
   if (nextType === PHOTO_TYPES.TEMPERATURE && !isAdminMode) {
     return;
   }
+  if (activePhotoMutationCount > 0 && activePhotoType !== nextType) {
+    showToast("현재 저장 작업이 끝난 뒤 사진 종류를 바꿔 주세요.");
+    return;
+  }
   if (activePhotoType === nextType) {
     renderPhotoTypeControls();
     return;
@@ -1865,9 +2311,18 @@ function renderPhotoTypeControls() {
     const buttonPhotoType = normalizePhotoType(button.dataset.photoType);
     const selected = buttonPhotoType === activePhotoType;
     const isTemperatureButton = buttonPhotoType === PHOTO_TYPES.TEMPERATURE;
+    const hideTemperatureButton = isTemperatureButton && !isAdminMode;
     button.setAttribute("aria-selected", String(selected));
+    button.hidden = hideTemperatureButton;
+    button.disabled = hideTemperatureButton;
+    button.tabIndex = hideTemperatureButton ? -1 : 0;
+    if (hideTemperatureButton) {
+      button.setAttribute("aria-hidden", "true");
+    } else {
+      button.removeAttribute("aria-hidden");
+    }
     button.classList.toggle("active", selected);
-    button.classList.toggle("temperature-stealth-tab", isTemperatureButton && !isAdminMode);
+    button.classList.toggle("temperature-stealth-tab", hideTemperatureButton);
     button.classList.toggle("temperature-visible-tab", isTemperatureButton && isAdminMode);
   });
 }
@@ -1883,6 +2338,7 @@ function loadAdminMode() {
 
 function setAdminMode(on) {
   isAdminMode = Boolean(on);
+  if (!isAdminMode) weatherMismatchFilterActive = false;
   try {
     localStorage.setItem(ADMIN_MODE_STORAGE_KEY, isAdminMode ? "1" : "0");
   } catch {
@@ -1892,11 +2348,13 @@ function setAdminMode(on) {
 
   // 관리자 모드를 끄면서 온도측정 탭을 보고 있었다면 습윤양생으로 되돌립니다.
   if (!isAdminMode && activePhotoType === PHOTO_TYPES.TEMPERATURE) {
-    setActivePhotoType(PHOTO_TYPES.CURING);
+    activePhotoType = PHOTO_TYPES.CURING;
+    renderPhotoTypeControls();
   } else {
     renderPhotoTypeControls();
   }
   renderAll();
+  if (isAdminMode) loadWeatherData().catch(() => {});
 }
 
 function applyAdminModeUi() {
@@ -1906,6 +2364,317 @@ function applyAdminModeUi() {
   if (elements.prevPourDateButton) elements.prevPourDateButton.disabled = !isAdminMode;
   if (elements.nextPourDateButton) elements.nextPourDateButton.disabled = !isAdminMode;
   renderDaySlotBlindButton();
+}
+
+function getWeatherFunctionUrl() {
+  if (config.weatherFunctionUrl) return String(config.weatherFunctionUrl);
+  if (!config.supabaseUrl) return "";
+  return `${String(config.supabaseUrl).replace(/\/$/, "")}/functions/v1/${WEATHER_FUNCTION_NAME}`;
+}
+
+async function loadWeatherData({ force = false } = {}) {
+  if (!force && (weatherLoadState === "loading" || weatherLoadState === "loaded")) return;
+
+  const functionUrl = getWeatherFunctionUrl();
+  if (!functionUrl) {
+    weatherLoadState = "error";
+    weatherLoadError = "기상 조회 주소가 설정되지 않았습니다.";
+    renderWeatherDataIfVisible();
+    return;
+  }
+
+  weatherLoadState = "loading";
+  weatherLoadError = "";
+  weatherLiveWarning = "";
+  renderWeatherDataIfVisible();
+
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), WEATHER_REQUEST_TIMEOUT_MS);
+  const headers = { Accept: "application/json" };
+  if (config.supabaseAnonKey) {
+    headers.apikey = config.supabaseAnonKey;
+  }
+
+  try {
+    const url = new URL(functionUrl);
+    url.searchParams.set("stationId", WEATHER_STATION_ID);
+    if (force) url.searchParams.set("refresh", String(Date.now()));
+    const response = await fetch(url, { headers, signal: controller.signal });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const errorPayload = await response.json();
+        detail = String(errorPayload?.error || "");
+      } catch {
+        // 응답 본문이 JSON이 아니면 상태 코드만 표시합니다.
+      }
+      throw new Error(detail || `기상 조회 실패 (${response.status})`);
+    }
+
+    const payload = await response.json();
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    const nextMap = new Map();
+    items.forEach((item) => {
+      const date = String(item?.date || "");
+      const rainMm = Number(item?.rainMm);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(rainMm)) return;
+      nextMap.set(date, {
+        date,
+        rainMm: Math.max(0, rainMm),
+        isFinal: item?.isFinal !== false,
+        fetchedAt: String(item?.fetchedAt || payload?.fetchedAt || ""),
+        source: String(item?.source || payload?.source?.name || "기상청"),
+      });
+    });
+
+    weatherDailyByDate = nextMap;
+    weatherFetchedAt = String(payload?.fetchedAt || "");
+    weatherPersistenceAvailable = payload?.persistence?.available === true;
+    weatherPersistenceMessage = String(payload?.persistence?.message || "");
+    weatherLiveWarning = String(payload?.warning || "");
+    weatherLoadState = "loaded";
+  } catch (error) {
+    weatherLoadState = "error";
+    weatherLoadError = error?.name === "AbortError"
+      ? "기상 조회 시간이 초과됐습니다."
+      : error?.message || "기상자료를 확인하지 못했습니다.";
+  } finally {
+    window.clearTimeout(timeoutId);
+    renderWeatherDataIfVisible();
+  }
+}
+
+function renderWeatherDataIfVisible() {
+  if (isAdminMode) renderWeatherAuditPanel();
+  renderBoardList();
+  if (activePhotoType === PHOTO_TYPES.CURING) {
+    renderSummary();
+    if (!isFilePickerOpen) renderDayGrid();
+  }
+}
+
+function getDayDateKey(day) {
+  if (!state.pourDate) return "";
+  return getDateKeyForPourDay(state.pourDate, day);
+}
+
+function getDateKeyForPourDay(pourDate, day) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(pourDate || ""));
+  const dayNo = Number(day);
+  if (!match || !Number.isInteger(dayNo) || dayNo < 1) return "";
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + dayNo - 1));
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
+}
+
+function getSeoulTodayDateKey() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function getWeatherRecord(date) {
+  const value = weatherDailyByDate.get(date);
+  if (typeof value === "number") {
+    return { date, rainMm: value, isFinal: date < getSeoulTodayDateKey(), fetchedAt: "", source: "기상청" };
+  }
+  return value || null;
+}
+
+function isPourDayDue(pourDate, dayNo, today = getSeoulTodayDateKey()) {
+  const date = getDateKeyForPourDay(pourDate, dayNo);
+  return Boolean(date) && date <= today;
+}
+
+function getRainAuditStatus(pourDate, dayNo) {
+  const date = getDateKeyForPourDay(pourDate, dayNo);
+  const today = getSeoulTodayDateKey();
+  if (!date) return "no-data";
+  if (date > today) return "future";
+  const weather = getWeatherRecord(date);
+  if (date === today || weather?.isFinal === false) return "pending";
+  if (!weather) return "no-data";
+  return Number(weather.rainMm) > 0 ? "confirmed" : "mismatch";
+}
+
+function renderWeatherProof(day, rainHold) {
+  if (!isAdminMode || activePhotoType !== PHOTO_TYPES.CURING) return "";
+
+  const date = getDayDateKey(day);
+  let className = "weather-proof admin-only";
+  let text = "기상청 확인 중";
+  let title = `${WEATHER_STATION_NAME} 일강수량을 확인하는 중입니다.`;
+
+  if (!date) {
+    className += " is-unavailable";
+    text = "타설일 입력 필요";
+    title = "타설일을 입력하면 날짜별 강수량을 확인합니다.";
+  } else if (weatherLoadState === "error") {
+    className += " is-unavailable";
+    text = "기상자료 연결 필요";
+    title = weatherLoadError || "기상자료를 확인하지 못했습니다.";
+  } else if (weatherLoadState === "loaded") {
+    if (!weatherDailyByDate.has(date)) {
+      className += " is-unavailable";
+      text = "기상자료 없음 · 확인 불가";
+      title = `${date} ${WEATHER_STATION_NAME} 자료를 확인할 수 없습니다.`;
+    } else {
+      const record = getWeatherRecord(date);
+      const rainMm = Number(record?.rainMm || 0);
+      const rainText = formatRainMm(rainMm);
+      const fetchedText = record?.fetchedAt ? ` · 수집 ${formatDateTime(record.fetchedAt)}` : "";
+      if (date === getSeoulTodayDateKey() || record?.isFinal === false) {
+        className += " is-pending";
+        text = `기상청 집계 중 · ${rainText}`;
+        title = `${date} ${WEATHER_STATION_NAME} 당일 누적강수량 ${rainText}이며 최종값은 다음 날 확정됩니다.${fetchedText}`;
+      } else if (rainMm > 0) {
+        className += " is-rain";
+        text = `기상청 ✓ 비 확인 · ${rainText}`;
+        title = `${date} ${WEATHER_STATION_NAME} 일강수량 ${rainText}${fetchedText}`;
+      } else if (rainHold) {
+        className += " is-mismatch";
+        text = "기상청 ⚠ 미관측·현장확인 · 0mm";
+        title = `${date} ${WEATHER_STATION_NAME} 일강수량은 0mm입니다. 국지성 강수 가능성이 있어 현장 확인이 필요합니다.${fetchedText}`;
+      } else {
+        className += " is-dry";
+        text = "기상청 비 미관측 · 0mm";
+        title = `${date} ${WEATHER_STATION_NAME} 일강수량 0mm${fetchedText}`;
+      }
+    }
+  }
+
+  return `<span class="${className}" title="${escapeAttribute(title)}">${escapeHtml(text)}</span>`;
+}
+
+function formatRainMm(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return "0mm";
+  return `${Number.isInteger(number) ? number.toFixed(0) : number.toFixed(1)}mm`;
+}
+
+function isBoardRainHoldEntry(entry) {
+  return isRainHoldEntry(entry) || parseEntryMemo(entry?.memo).rainHold;
+}
+
+function getBoardRainAuditRecords(board) {
+  return getEntryItems(board?.entries || {})
+    .filter(({ entry }) => isBoardRainHoldEntry(entry))
+    .map(({ dayNo }) => {
+      const date = getDateKeyForPourDay(board?.pourDate, dayNo);
+      const weather = date ? getWeatherRecord(date) : null;
+      const status = getRainAuditStatus(board?.pourDate, dayNo);
+      return {
+        board,
+        dayNo,
+        date,
+        weather,
+        status,
+      };
+    });
+}
+
+function getRainAuditStats(sourceBoards = boardList) {
+  const records = (sourceBoards || []).flatMap(getBoardRainAuditRecords);
+  return {
+    records,
+    registered: records.length,
+    confirmed: records.filter((record) => record.status === "confirmed").length,
+    mismatch: records.filter((record) => record.status === "mismatch").length,
+    noData: records.filter((record) => record.status === "no-data").length,
+    pending: records.filter((record) => record.status === "pending" || record.status === "future").length,
+  };
+}
+
+function handleWeatherAuditClick(event) {
+  const refreshButton = event.target.closest("[data-weather-refresh]");
+  if (refreshButton) {
+    loadWeatherData({ force: true }).catch(console.error);
+    return;
+  }
+
+  const filterButton = event.target.closest("[data-weather-mismatch-filter]");
+  if (filterButton) {
+    weatherMismatchFilterActive = !weatherMismatchFilterActive;
+    renderWeatherAuditPanel();
+    renderBoardList();
+    return;
+  }
+
+  const recordButton = event.target.closest("[data-weather-board-code]");
+  if (recordButton) openBoard(recordButton.dataset.weatherBoardCode).catch(console.error);
+}
+
+function renderWeatherAuditPanel() {
+  if (!elements.weatherAuditPanel) return;
+  if (!isAdminMode) {
+    elements.weatherAuditPanel.innerHTML = "";
+    return;
+  }
+
+  const stats = getRainAuditStats();
+  const mismatches = stats.records.filter((record) => record.status === "mismatch");
+  const persistenceClass = weatherPersistenceAvailable ? "is-ok" : "is-warning";
+  let connectionText = "기상자료 확인 대기";
+  let connectionClass = "is-loading";
+
+  if (weatherLoadState === "loading") {
+    connectionText = "기상청 자료를 확인하는 중입니다.";
+  } else if (weatherLoadState === "error") {
+    connectionText = weatherLoadError || "기상자료를 확인하지 못했습니다.";
+    connectionClass = "is-error";
+  } else if (weatherLoadState === "loaded") {
+    connectionClass = persistenceClass;
+    if (!weatherPersistenceAvailable) {
+      connectionText = weatherPersistenceMessage || "과거 기상자료 영구 저장 연결을 확인해 주세요.";
+    } else if (weatherLiveWarning) {
+      connectionText = `실시간 조회 지연 · 저장된 과거자료로 표시 중 (${weatherLiveWarning})`;
+      connectionClass = "is-warning";
+    } else {
+      const fetchedText = weatherFetchedAt ? ` · 최근 조회 ${formatDateTime(weatherFetchedAt)}` : "";
+      connectionText = `과거 기상자료 자동 저장 정상${fetchedText}`;
+    }
+  }
+
+  const mismatchList = mismatches.length
+    ? `<div class="weather-audit-mismatch-list" aria-label="기상청 미관측 목록">
+        ${mismatches.map((record) => `
+          <button class="weather-audit-record" type="button" data-weather-board-code="${escapeAttribute(record.board.shareCode)}">
+            <span>${escapeHtml(record.date || "날짜 없음")}</span>
+            <strong>${escapeHtml(record.board.pourPart || "미입력")}</strong>
+            <small>${escapeHtml(`${record.dayNo}일차 · 0mm · 현장확인 필요`)}</small>
+          </button>
+        `).join("")}
+      </div>`
+    : `<p class="weather-audit-empty">현재 기상청 0mm 불일치 건이 없습니다.</p>`;
+
+  elements.weatherAuditPanel.innerHTML = `
+    <div class="weather-audit-heading">
+      <div>
+        <strong>기상청 우천 검증</strong>
+        <p>${escapeHtml(`${WEATHER_STATION_NAME} ${WEATHER_STATION_ID} · 현장 약 ${WEATHER_STATION_DISTANCE_KM}km · 일강수량 0mm 초과 시 비 확인`)}</p>
+      </div>
+      <button class="small-button weather-refresh-button" type="button" data-weather-refresh ${weatherLoadState === "loading" ? "disabled" : ""}>다시 조회</button>
+    </div>
+    <div class="weather-audit-stats">
+      <span><small>우천 등록</small><strong>${stats.registered}</strong></span>
+      <span class="is-confirmed"><small>강수 확인</small><strong>${stats.confirmed}</strong></span>
+      <span class="is-mismatch"><small>0mm·현장확인</small><strong>${stats.mismatch}</strong></span>
+      <span class="is-no-data"><small>자료 없음</small><strong>${stats.noData}</strong></span>
+      <span class="is-pending"><small>미도래·집계 중</small><strong>${stats.pending}</strong></span>
+    </div>
+    <div class="weather-audit-toolbar">
+      <span class="weather-audit-connection ${connectionClass}">${escapeHtml(connectionText)}</span>
+      <button class="small-button weather-mismatch-filter ${weatherMismatchFilterActive ? "active" : ""}" type="button" data-weather-mismatch-filter aria-pressed="${weatherMismatchFilterActive}">
+        ${weatherMismatchFilterActive ? "전체 대지 보기" : `불일치 ${stats.mismatch}건만 보기`}
+      </button>
+    </div>
+    ${mismatchList}
+    <p class="weather-audit-note">0mm는 허위 판정이 아니라 ‘기상청 미관측’입니다. 국지성 소나기 가능성이 있어 현장자료를 함께 확인하세요.</p>
+  `;
 }
 
 function cleanupLegacyPreferences() {
@@ -1918,76 +2687,259 @@ function cleanupLegacyPreferences() {
 }
 
 // ===== 일차 슬롯 구성(관리자 편집) =====
-function getStoredDaySlotList() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(DAY_SLOT_LIST_STORAGE_KEY) || "null");
-    if (Array.isArray(raw)) {
-      const cleaned = Array.from(
-        new Set(raw.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1))
-      ).sort((a, b) => a - b);
-      if (cleaned.length) return cleaned;
-    }
-  } catch {
-    // 무시하고 기본값 사용
-  }
-  return Array.from({ length: DEFAULT_DAY_SLOT_COUNT }, (_, index) => index + 1);
-}
-
-function saveDaySlotList(list) {
+function cleanBoardSlotList(list, fallback, maxCount) {
   const cleaned = Array.from(
-    new Set((list || []).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1))
-  ).sort((a, b) => a - b);
-  const finalList = cleaned.length ? cleaned : [1];
-  try {
-    localStorage.setItem(DAY_SLOT_LIST_STORAGE_KEY, JSON.stringify(finalList));
-  } catch {
-    // 무시
-  }
-  return finalList;
+    new Set((Array.isArray(list) ? list : []).map(Number).filter((value) => Number.isInteger(value) && value >= 1))
+  )
+    .sort((a, b) => a - b)
+    .slice(0, maxCount);
+  return cleaned.length ? cleaned : [...fallback];
 }
 
-function getStoredTemperatureSlotList() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(TEMPERATURE_SLOT_LIST_STORAGE_KEY) || "null");
-    if (Array.isArray(raw)) {
-      const cleaned = Array.from(
-        new Set(raw.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1))
-      ).sort((a, b) => a - b);
-      if (cleaned.length) return cleaned;
-    }
-  } catch {
-    // 무시하고 기본값 사용
-  }
-  return Array.from({ length: DEFAULT_TEMPERATURE_SLOT_COUNT }, (_, index) => index + 1);
+function cleanDaySlotLabels(labels) {
+  if (!labels || typeof labels !== "object" || Array.isArray(labels)) return {};
+  return Object.fromEntries(
+    Object.entries(labels)
+      .map(([day, label]) => [String(Number(day)), typeof label === "string" ? label.trim().slice(0, 80) : ""])
+      .filter(([day, label]) => Number.isInteger(Number(day)) && Number(day) >= 1 && label)
+  );
 }
 
-function saveTemperatureSlotList(list) {
-  const cleaned = Array.from(
-    new Set((list || []).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1))
-  ).sort((a, b) => a - b);
-  const finalList = cleaned.length ? cleaned : [1];
+function readSettingsObject(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return {};
   try {
-    localStorage.setItem(TEMPERATURE_SLOT_LIST_STORAGE_KEY, JSON.stringify(finalList));
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch {
-    // 무시
+    return {};
   }
-  return finalList;
 }
 
-function loadExtraDaySlotHiddenMode() {
+function normalizeBoardSettings(value, { fallback = null } = {}) {
+  const defaults = createDefaultBoardSettings();
+  const fallbackSource = readSettingsObject(fallback);
+  const source = readSettingsObject(value);
+  const base = {
+    daySlots: cleanBoardSlotList(fallbackSource.daySlots, defaults.daySlots, MAX_DAY_SLOT_COUNT),
+    temperatureSlots: cleanBoardSlotList(
+      fallbackSource.temperatureSlots,
+      defaults.temperatureSlots,
+      MAX_TEMPERATURE_SLOT_COUNT
+    ),
+    extraDaySlotsHidden:
+      typeof fallbackSource.extraDaySlotsHidden === "boolean" ? fallbackSource.extraDaySlotsHidden : false,
+    dayLabels: cleanDaySlotLabels(fallbackSource.dayLabels),
+  };
+
+  return {
+    daySlots: Array.isArray(source.daySlots)
+      ? cleanBoardSlotList(source.daySlots, base.daySlots, MAX_DAY_SLOT_COUNT)
+      : base.daySlots,
+    temperatureSlots: Array.isArray(source.temperatureSlots)
+      ? cleanBoardSlotList(source.temperatureSlots, base.temperatureSlots, MAX_TEMPERATURE_SLOT_COUNT)
+      : base.temperatureSlots,
+    extraDaySlotsHidden:
+      typeof source.extraDaySlotsHidden === "boolean" ? source.extraDaySlotsHidden : base.extraDaySlotsHidden,
+    dayLabels:
+      source.dayLabels && typeof source.dayLabels === "object"
+        ? cleanDaySlotLabels(source.dayLabels)
+        : base.dayLabels,
+  };
+}
+
+function readLegacySlotList(key, count, maxCount) {
   try {
-    return localStorage.getItem(DAY_SLOT_EXTRA_HIDDEN_STORAGE_KEY) === "1";
+    const raw = JSON.parse(localStorage.getItem(key) || "null");
+    return cleanBoardSlotList(raw, Array.from({ length: count }, (_, index) => index + 1), maxCount);
+  } catch {
+    return Array.from({ length: count }, (_, index) => index + 1);
+  }
+}
+
+function getLegacyBoardSettings() {
+  let extraDaySlotsHidden = false;
+  let dayLabels = {};
+  try {
+    extraDaySlotsHidden = localStorage.getItem(DAY_SLOT_EXTRA_HIDDEN_STORAGE_KEY) === "1";
+    dayLabels = JSON.parse(localStorage.getItem(DAY_SLOT_LABELS_STORAGE_KEY) || "{}");
+  } catch {
+    // 구 버전 개인 설정이 없으면 기본값을 사용합니다.
+  }
+  return normalizeBoardSettings({
+    daySlots: readLegacySlotList(DAY_SLOT_LIST_STORAGE_KEY, DEFAULT_DAY_SLOT_COUNT, MAX_DAY_SLOT_COUNT),
+    temperatureSlots: readLegacySlotList(
+      TEMPERATURE_SLOT_LIST_STORAGE_KEY,
+      DEFAULT_TEMPERATURE_SLOT_COUNT,
+      MAX_TEMPERATURE_SLOT_COUNT
+    ),
+    extraDaySlotsHidden,
+    dayLabels,
+  });
+}
+
+function loadBoardSettingsFallback(shareCode) {
+  if (!shareCode) return null;
+  try {
+    const saved = localStorage.getItem(BOARD_SETTINGS_FALLBACK_PREFIX + shareCode);
+    return saved ? normalizeBoardSettings(JSON.parse(saved)) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveBoardSettingsFallback(shareCode, settings) {
+  if (!shareCode) return false;
+  try {
+    localStorage.setItem(BOARD_SETTINGS_FALLBACK_PREFIX + shareCode, JSON.stringify(normalizeBoardSettings(settings)));
+    return true;
   } catch {
     return false;
   }
 }
 
-function saveExtraDaySlotHiddenMode(enabled) {
+function clearBoardSettingsFallback(shareCode) {
   try {
-    localStorage.setItem(DAY_SLOT_EXTRA_HIDDEN_STORAGE_KEY, enabled ? "1" : "0");
+    localStorage.removeItem(BOARD_SETTINGS_FALLBACK_PREFIX + shareCode);
   } catch {
-    // 무시
+    // 정리 실패는 서버 저장 결과에 영향을 주지 않습니다.
   }
+}
+
+function hasBoardSettingsFields(value) {
+  const source = readSettingsObject(value);
+  return ["daySlots", "temperatureSlots", "extraDaySlotsHidden", "dayLabels"].some((key) =>
+    Object.prototype.hasOwnProperty.call(source, key)
+  );
+}
+
+function getBoardSettingsForRecord(board, shareCode) {
+  const hasSettingsColumn = Boolean(board && Object.prototype.hasOwnProperty.call(board, "settings"));
+  if (hasSettingsColumn) boardSettingsColumnAvailable = true;
+  const localFallback = loadBoardSettingsFallback(shareCode);
+  const migrationFallback = localFallback || getLegacyBoardSettings();
+  return normalizeBoardSettings(board?.settings, {
+    fallback: hasBoardSettingsFields(board?.settings) ? null : migrationFallback,
+  });
+}
+
+function updateBoardListSettings(shareCode, settings) {
+  const board = boardList.find((item) => item.shareCode === shareCode);
+  if (board) board.settings = normalizeBoardSettings(settings);
+}
+
+function updateBoardSettings(mutator) {
+  if (!state.shareCode) return Promise.resolve(false);
+  const previous = normalizeBoardSettings(state.settings);
+  const draft = normalizeBoardSettings(previous);
+  const mutated = typeof mutator === "function" ? mutator(draft) || draft : mutator;
+  const next = normalizeBoardSettings(mutated, { fallback: previous });
+  if (JSON.stringify(previous) === JSON.stringify(next)) return Promise.resolve(true);
+
+  const context = {
+    shareCode: state.shareCode,
+    boardId: state.boardId,
+    revision: ++boardSettingsRevision,
+    previous,
+    next,
+  };
+  state.settings = next;
+  updateBoardListSettings(context.shareCode, next);
+  printImageCache = { signature: "", images: [] };
+  renderAll();
+
+  const persist = () => persistBoardSettingsChange(context);
+  boardSettingsSaveCount += 1;
+  const promise = boardSettingsSaveChain.then(persist, persist);
+  boardSettingsSaveChain = promise
+    .catch(() => {})
+    .finally(async () => {
+      boardSettingsSaveCount = Math.max(0, boardSettingsSaveCount - 1);
+      await flushPendingRealtimeRefresh();
+    });
+  return promise;
+}
+
+async function persistBoardSettingsChange(context) {
+  let saved = false;
+  let error = null;
+
+  if (!dbClient || !context.boardId) {
+    if (state.shareCode === context.shareCode) {
+      saved = saveLocalBoard();
+    } else {
+      saved = saveBoardSettingsFallback(context.shareCode, context.next);
+    }
+  } else if (boardSettingsColumnAvailable !== false) {
+    const result = await dbClient
+      .from("photo_boards")
+      .update({ settings: context.next })
+      .eq("id", context.boardId)
+      .select("id, settings")
+      .maybeSingle();
+    error = result.error;
+    if (error && isMissingBackendFeature(error, "settings")) {
+      boardSettingsColumnAvailable = false;
+      error = null;
+    } else if (!error) {
+      boardSettingsColumnAvailable = true;
+      saved = Boolean(result.data);
+      if (saved) clearBoardSettingsFallback(context.shareCode);
+    }
+  }
+
+  if (!saved && !error && dbClient && context.boardId && boardSettingsColumnAvailable === false) {
+    saved = saveBoardSettingsFallback(context.shareCode, context.next);
+  }
+
+  if (saved) return true;
+
+  if (error) console.error(error);
+  if (
+    state.shareCode === context.shareCode &&
+    state.boardId === context.boardId &&
+    boardSettingsRevision === context.revision
+  ) {
+    state.settings = context.previous;
+    updateBoardListSettings(context.shareCode, context.previous);
+    renderAll();
+  }
+  showToast("일차 설정을 저장하지 못했습니다. 다시 시도해 주세요.");
+  return false;
+}
+
+function getStoredDaySlotList(settings = state.settings) {
+  return normalizeBoardSettings(settings).daySlots;
+}
+
+function saveDaySlotList(list) {
+  return updateBoardSettings((settings) => {
+    settings.daySlots = cleanBoardSlotList(list, [1], MAX_DAY_SLOT_COUNT);
+    return settings;
+  });
+}
+
+function getStoredTemperatureSlotList(settings = state.settings) {
+  return normalizeBoardSettings(settings).temperatureSlots;
+}
+
+function saveTemperatureSlotList(list) {
+  return updateBoardSettings((settings) => {
+    settings.temperatureSlots = cleanBoardSlotList(list, [1], MAX_TEMPERATURE_SLOT_COUNT);
+    return settings;
+  });
+}
+
+function loadExtraDaySlotHiddenMode(settings = state.settings) {
+  return normalizeBoardSettings(settings).extraDaySlotsHidden;
+}
+
+function saveExtraDaySlotHiddenMode(enabled) {
+  return updateBoardSettings((settings) => {
+    settings.extraDaySlotsHidden = Boolean(enabled);
+    return settings;
+  });
 }
 
 function loadPrintDayLabelBlindMode() {
@@ -2016,19 +2968,23 @@ function renderDaySlotBlindButton() {
   elements.dayBlindButton.setAttribute("aria-label", enabled ? "인쇄 일차 표시" : "인쇄 일차 블라인드");
 }
 
-function setAllBoardsToTwoDaySlots() {
+async function setAllBoardsToTwoDaySlots() {
   if (!isAdminMode) return;
 
   const ok = window.confirm(
-    "모든 타설부위를 1·2일차만 보이도록 변경합니다.\n\n3일차 이후 사진은 삭제하지 않고 블라인드 처리합니다."
+    "현재 사진대지를 1·2일차만 보이도록 변경합니다.\n\n3일차 이후 사진은 삭제하지 않고 블라인드 처리합니다."
   );
   if (!ok) return;
 
-  saveDaySlotList(Array.from({ length: TWO_DAY_SLOT_COUNT }, (_, index) => index + 1));
-  saveExtraDaySlotHiddenMode(true);
+  const saved = await updateBoardSettings((settings) => {
+    settings.daySlots = Array.from({ length: TWO_DAY_SLOT_COUNT }, (_, index) => index + 1);
+    settings.extraDaySlotsHidden = true;
+    return settings;
+  });
+  if (!saved) return;
   pasteTargetDay = null;
   renderAll();
-  showToast("모든 타설부위를 2일차 기준으로 표시합니다.");
+  showToast("현재 사진대지를 2일차 기준으로 표시합니다.");
 }
 
 function toggleDaySlotBlindMode() {
@@ -2063,7 +3019,7 @@ function getEntryDayNo(entry, fallback) {
 function hasDaySlotData(entry) {
   return (
     hasEntryPhoto(entry, PHOTO_TYPES.CURING) ||
-    isRainHoldEntry(entry)
+    isBoardRainHoldEntry(entry)
   );
 }
 
@@ -2072,9 +3028,9 @@ function hasTemperatureSlotData(entry) {
 }
 
 // 실제 표시 일차 = 설정된 슬롯 ∪ 이미 사진/데이터가 있는 일차(블라인드가 꺼져 있을 때만 하위 호환 표시).
-function getDaySlotList(entries = state.entries) {
-  const set = new Set(getStoredDaySlotList());
-  if (!loadExtraDaySlotHiddenMode()) {
+function getDaySlotList(entries = state.entries, settings = state.settings) {
+  const set = new Set(getStoredDaySlotList(settings));
+  if (!loadExtraDaySlotHiddenMode(settings)) {
     getEntryItems(entries).forEach(({ entry, dayNo }) => {
       if (!dayNo || !entry || !hasDaySlotData(entry)) return;
       set.add(dayNo);
@@ -2083,8 +3039,8 @@ function getDaySlotList(entries = state.entries) {
   return Array.from(set).sort((a, b) => a - b);
 }
 
-function getTemperatureSlotList(entries = state.entries) {
-  const set = new Set(getStoredTemperatureSlotList());
+function getTemperatureSlotList(entries = state.entries, settings = state.settings) {
+  const set = new Set(getStoredTemperatureSlotList(settings));
   getEntryItems(entries).forEach(({ entry, dayNo }) => {
     if (!dayNo || !entry || !hasTemperatureSlotData(entry)) return;
     set.add(dayNo);
@@ -2092,18 +3048,18 @@ function getTemperatureSlotList(entries = state.entries) {
   return Array.from(set).sort((a, b) => a - b);
 }
 
-function getPhotoSlotList(photoType = activePhotoType, entries = state.entries) {
+function getPhotoSlotList(photoType = activePhotoType, entries = state.entries, settings = state.settings) {
   const normalizedType = normalizePhotoType(photoType);
   return normalizedType === PHOTO_TYPES.TEMPERATURE
-    ? getTemperatureSlotList(entries)
-    : getDaySlotList(entries);
+    ? getTemperatureSlotList(entries, settings)
+    : getDaySlotList(entries, settings);
 }
 
-function getDaySlotCount(entries = state.entries) {
-  return getDaySlotList(entries).length;
+function getDaySlotCount(entries = state.entries, settings = state.settings) {
+  return getDaySlotList(entries, settings).length;
 }
 
-function addDaySlot() {
+async function addDaySlot() {
   const list = getStoredDaySlotList();
   const displayed = getDaySlotList();
   if (displayed.length >= MAX_DAY_SLOT_COUNT) {
@@ -2112,12 +3068,12 @@ function addDaySlot() {
   }
   const nextDay = (displayed[displayed.length - 1] || 0) + 1;
   list.push(nextDay);
-  saveDaySlotList(list);
-  renderAll();
+  const saved = await saveDaySlotList(list);
+  if (!saved) return;
   showToast(`${getPhotoSlotLabel(nextDay, PHOTO_TYPES.CURING)}을(를) 추가했습니다.`);
 }
 
-function addTemperatureSlot() {
+async function addTemperatureSlot() {
   const list = getStoredTemperatureSlotList();
   const displayed = getTemperatureSlotList();
   if (displayed.length >= MAX_TEMPERATURE_SLOT_COUNT) {
@@ -2126,17 +3082,17 @@ function addTemperatureSlot() {
   }
   const nextSlot = (displayed[displayed.length - 1] || 0) + 1;
   list.push(nextSlot);
-  saveTemperatureSlotList(list);
-  renderAll();
+  const saved = await saveTemperatureSlotList(list);
+  if (!saved) return;
   showToast(`${getPhotoSlotLabel(nextSlot, PHOTO_TYPES.TEMPERATURE)}을(를) 추가했습니다.`);
 }
 
-function addPhotoSlot(photoType = activePhotoType) {
+async function addPhotoSlot(photoType = activePhotoType) {
   if (normalizePhotoType(photoType) === PHOTO_TYPES.TEMPERATURE) {
-    addTemperatureSlot();
+    await addTemperatureSlot();
     return;
   }
-  addDaySlot();
+  await addDaySlot();
 }
 
 async function removeDaySlot(day) {
@@ -2163,19 +3119,30 @@ async function removeDaySlot(day) {
   });
   if (!confirmed) return;
 
-  // 사진이 있으면 먼저 저장소에서 삭제
-  if (entry) {
-    if (hasEntryPhoto(entry, PHOTO_TYPES.CURING)) await deletePhoto(PHOTO_TYPES.CURING, dayNo, { skipConfirm: true });
-    entry.rainHold = false;
-    if (hadRainHold && !hasEntryPhoto(entry, PHOTO_TYPES.CURING)) {
-      await persistEntry(dayNo, PHOTO_TYPES.CURING);
+  beginPhotoMutation();
+  try {
+    // 사진이 있으면 먼저 저장소에서 삭제
+    if (entry) {
+      if (hasEntryPhoto(entry, PHOTO_TYPES.CURING)) {
+        const deleted = await deletePhoto(PHOTO_TYPES.CURING, dayNo, { skipConfirm: true });
+        if (!deleted) return;
+      }
+      if (hadRainHold && !hasEntryPhoto(entry, PHOTO_TYPES.CURING)) {
+        const cleared = await persistEntry(dayNo, PHOTO_TYPES.CURING, { rainHold: false });
+        if (!cleared) {
+          showToast(`${label} 우천 설정을 지우지 못해 일차 삭제를 중단했습니다.`);
+          return;
+        }
+      }
     }
-  }
 
-  const remaining = getStoredDaySlotList().filter((value) => value !== dayNo);
-  saveDaySlotList(remaining);
-  renderAll();
-  showToast(`${label}을(를) 삭제했습니다.`);
+    const remaining = getStoredDaySlotList().filter((value) => value !== dayNo);
+    const saved = await saveDaySlotList(remaining);
+    if (!saved) return;
+    showToast(`${label}을(를) 삭제했습니다.`);
+  } finally {
+    await endPhotoMutation();
+  }
 }
 
 async function removeTemperatureSlot(slot) {
@@ -2200,14 +3167,20 @@ async function removeTemperatureSlot(slot) {
   });
   if (!confirmed) return;
 
-  if (entry && hasPhoto) {
-    await deletePhoto(PHOTO_TYPES.TEMPERATURE, slotNo, { skipConfirm: true });
-  }
+  beginPhotoMutation();
+  try {
+    if (entry && hasPhoto) {
+      const deleted = await deletePhoto(PHOTO_TYPES.TEMPERATURE, slotNo, { skipConfirm: true });
+      if (!deleted) return;
+    }
 
-  const remaining = getStoredTemperatureSlotList().filter((value) => value !== slotNo);
-  saveTemperatureSlotList(remaining);
-  renderAll();
-  showToast(`${label}을(를) 삭제했습니다.`);
+    const remaining = getStoredTemperatureSlotList().filter((value) => value !== slotNo);
+    const saved = await saveTemperatureSlotList(remaining);
+    if (!saved) return;
+    showToast(`${label}을(를) 삭제했습니다.`);
+  } finally {
+    await endPhotoMutation();
+  }
 }
 
 async function removePhotoSlot(photoType, slot) {
@@ -2218,7 +3191,7 @@ async function removePhotoSlot(photoType, slot) {
   await removeDaySlot(slot);
 }
 
-function renameDaySlot(day) {
+async function renameDaySlot(day) {
   const dayNo = Number(day);
   if (!Number.isInteger(dayNo) || dayNo < 1) return;
   const labels = loadDaySlotLabels();
@@ -2234,42 +3207,38 @@ function renameDaySlot(day) {
   } else {
     delete labels[dayNo];
   }
-  saveDaySlotLabels(labels);
-  renderAll();
+  const saved = await saveDaySlotLabels(labels);
+  if (!saved) return;
   showToast("일차 이름을 변경했습니다.");
 }
 
-function loadDaySlotLabels() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(DAY_SLOT_LABELS_STORAGE_KEY) || "{}");
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
+function loadDaySlotLabels(settings = state.settings) {
+  return normalizeBoardSettings(settings).dayLabels;
 }
 
 function saveDaySlotLabels(map) {
-  try {
-    localStorage.setItem(DAY_SLOT_LABELS_STORAGE_KEY, JSON.stringify(map || {}));
-  } catch {
-    // 무시
-  }
+  return updateBoardSettings((settings) => {
+    settings.dayLabels = cleanDaySlotLabels(map);
+    return settings;
+  });
 }
 
-function getDaySlotCustomLabel(day) {
-  const value = loadDaySlotLabels()[Number(day)];
+function getDaySlotCustomLabel(day, settings = state.settings) {
+  const value = loadDaySlotLabels(settings)[Number(day)];
   return typeof value === "string" ? value.trim() : "";
 }
 
 // ===== 위험 작업 확인 다이얼로그(사진 개수 표시 + 카운트다운) =====
 function confirmDangerousAction({ title, message, confirmLabel = "삭제", countdownSeconds = 0 } = {}) {
   return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialogId = `confirm-dialog-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const overlay = document.createElement("div");
     overlay.className = "confirm-overlay";
     overlay.innerHTML = `
-      <div class="confirm-dialog" role="dialog" aria-modal="true">
-        <h3 class="confirm-title"></h3>
-        <p class="confirm-message"></p>
+      <div class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="${dialogId}-title" aria-describedby="${dialogId}-message">
+        <h3 id="${dialogId}-title" class="confirm-title"></h3>
+        <p id="${dialogId}-message" class="confirm-message"></p>
         <div class="confirm-actions">
           <button type="button" class="small-button confirm-cancel">취소</button>
           <button type="button" class="small-button danger-button confirm-ok"></button>
@@ -2298,6 +3267,7 @@ function confirmDangerousAction({ title, message, confirmLabel = "삭제", count
       if (timer) window.clearInterval(timer);
       document.removeEventListener("keydown", onKeydown, true);
       overlay.remove();
+      if (previousFocus?.isConnected && typeof previousFocus.focus === "function") previousFocus.focus();
       resolve(result);
     };
 
@@ -2305,6 +3275,8 @@ function confirmDangerousAction({ title, message, confirmLabel = "삭제", count
       if (event.key === "Escape") {
         event.preventDefault();
         cleanup(false);
+      } else if (event.key === "Tab") {
+        trapDialogFocus(overlay, event);
       }
     };
 
@@ -2346,13 +3318,16 @@ function normalizeEntryShape(entry) {
   const memoCuringPhoto = memo.photos?.[PHOTO_TYPES.CURING];
   if (memoCuringPhoto) {
     if (!entry.verifiedAt) {
-      entry.verifiedAt = memoCuringPhoto.verifiedAt || memoCuringPhoto.verified_at || entry.uploadedAt || entry.uploaded_at || "";
+      entry.verifiedAt = memoCuringPhoto.verifiedAt || memoCuringPhoto.verified_at || "";
     }
     if (!entry.capturedAt) {
       entry.capturedAt = memoCuringPhoto.capturedAt || memoCuringPhoto.captured_at || "";
     }
     if (!entry.capturedAtSource) {
       entry.capturedAtSource = memoCuringPhoto.capturedAtSource || memoCuringPhoto.captured_at_source || "";
+    }
+    if (!entry.verifiedAtSource) {
+      entry.verifiedAtSource = memoCuringPhoto.verifiedAtSource || memoCuringPhoto.verified_at_source || "";
     }
     if (!entry.sizeBytes && memoCuringPhoto.sizeBytes) {
       entry.sizeBytes = Number(memoCuringPhoto.sizeBytes || 0);
@@ -2384,7 +3359,8 @@ function getTypedPhoto(entry, photoType = activePhotoType) {
       photoUrl: source.photoUrl || source.photo_url || "",
       photoPath: source.photoPath || source.photo_path || "",
       uploadedAt: source.uploadedAt || source.uploaded_at || "",
-      verifiedAt: source.verifiedAt || source.verified_at || source.uploadedAt || source.uploaded_at || "",
+      verifiedAt: source.verifiedAt || source.verified_at || "",
+      verifiedAtSource: source.verifiedAtSource || source.verified_at_source || "",
       capturedAt: source.capturedAt || source.captured_at || "",
       capturedAtSource: source.capturedAtSource || source.captured_at_source || "",
       sizeBytes: Number(source.sizeBytes || 0),
@@ -2396,7 +3372,8 @@ function getTypedPhoto(entry, photoType = activePhotoType) {
     photoUrl: typed.photoUrl || typed.photo_url || "",
     photoPath: typed.photoPath || typed.photo_path || "",
     uploadedAt: typed.uploadedAt || typed.uploaded_at || "",
-    verifiedAt: typed.verifiedAt || typed.verified_at || typed.uploadedAt || typed.uploaded_at || "",
+    verifiedAt: typed.verifiedAt || typed.verified_at || "",
+    verifiedAtSource: typed.verifiedAtSource || typed.verified_at_source || "",
     capturedAt: typed.capturedAt || typed.captured_at || "",
     capturedAtSource: typed.capturedAtSource || typed.captured_at_source || "",
     sizeBytes: Number(typed.sizeBytes || 0),
@@ -2411,7 +3388,8 @@ function setTypedPhoto(entry, photoType, photo) {
     entry.photoUrl = photo.photoUrl || "";
     entry.photoPath = photo.photoPath || "";
     entry.uploadedAt = photo.uploadedAt || "";
-    entry.verifiedAt = photo.verifiedAt || photo.uploadedAt || "";
+    entry.verifiedAt = photo.verifiedAt || "";
+    entry.verifiedAtSource = photo.verifiedAtSource || "";
     entry.capturedAt = photo.capturedAt || "";
     entry.capturedAtSource = photo.capturedAtSource || "";
     entry.sizeBytes = Number(photo.sizeBytes || 0);
@@ -2423,7 +3401,8 @@ function setTypedPhoto(entry, photoType, photo) {
     photoUrl: photo.photoUrl || "",
     photoPath: photo.photoPath || "",
     uploadedAt: photo.uploadedAt || "",
-    verifiedAt: photo.verifiedAt || photo.uploadedAt || "",
+    verifiedAt: photo.verifiedAt || "",
+    verifiedAtSource: photo.verifiedAtSource || "",
     capturedAt: photo.capturedAt || "",
     capturedAtSource: photo.capturedAtSource || "",
     sizeBytes: Number(photo.sizeBytes || 0),
@@ -2436,6 +3415,7 @@ function clearTypedPhoto(entry, photoType) {
     photoPath: "",
     uploadedAt: "",
     verifiedAt: "",
+    verifiedAtSource: "",
     capturedAt: "",
     capturedAtSource: "",
     sizeBytes: 0,
@@ -2446,19 +3426,44 @@ function hasEntryPhoto(entry, photoType = PHOTO_TYPES.CURING) {
   return Boolean(getTypedPhoto(entry, photoType).photoUrl);
 }
 
-function isCompletedEntry(entry, photoType = PHOTO_TYPES.CURING) {
-  if (normalizePhotoType(photoType) === PHOTO_TYPES.CURING) {
-    return hasEntryPhoto(entry, PHOTO_TYPES.CURING) || isRainHoldEntry(normalizeEntryShape(entry || {})) || parseEntryMemo(entry?.memo).rainHold;
-  }
-
-  return hasEntryPhoto(entry, photoType);
+function isCompletedEntry(entry, photoType = PHOTO_TYPES.CURING, context = {}) {
+  const normalizedType = normalizePhotoType(photoType);
+  if (normalizedType !== PHOTO_TYPES.CURING) return hasEntryPhoto(entry, normalizedType);
+  if (!isPourDayDue(context.pourDate, context.dayNo)) return false;
+  if (hasEntryPhoto(entry, PHOTO_TYPES.CURING)) return true;
+  if (!isBoardRainHoldEntry(entry)) return false;
+  return getRainAuditStatus(context.pourDate, context.dayNo) === "confirmed";
 }
 
-function countCompletedEntries(entries, photoType = PHOTO_TYPES.CURING, visibleDaySet = null) {
+function countCompletedEntries(entries, photoType = PHOTO_TYPES.CURING, visibleDaySet = null, context = {}) {
   return getEntryItems(entries).filter(({ entry, dayNo }) => {
     if (visibleDaySet && !visibleDaySet.has(dayNo)) return false;
-    return isCompletedEntry(entry, photoType);
+    return isCompletedEntry(entry, photoType, { ...context, dayNo });
   }).length;
+}
+
+function getEntryCompletionDisplay(entry, photoType, dayNo, pourDate = state.pourDate) {
+  const normalizedType = normalizePhotoType(photoType);
+  const hasPhoto = hasEntryPhoto(entry, normalizedType);
+  if (normalizedType !== PHOTO_TYPES.CURING) {
+    return { complete: hasPhoto, statusText: hasPhoto ? "등록" : "미등록" };
+  }
+
+  const due = isPourDayDue(pourDate, dayNo);
+  if (hasPhoto) {
+    return {
+      complete: due,
+      statusText: due ? "등록" : "사전등록·미집계",
+    };
+  }
+
+  if (!isBoardRainHoldEntry(entry)) return { complete: false, statusText: "미등록" };
+  const rainStatus = getRainAuditStatus(pourDate, dayNo);
+  if (rainStatus === "confirmed") return { complete: true, statusText: "우천확인" };
+  if (rainStatus === "future") return { complete: false, statusText: "우천예정·미집계" };
+  if (rainStatus === "mismatch") return { complete: false, statusText: "우천 현장확인" };
+  if (rainStatus === "no-data") return { complete: false, statusText: "우천 자료없음" };
+  return { complete: false, statusText: "우천 확인중" };
 }
 
 function countPhotoEntries(entries, visibleDaySet = null) {
@@ -2499,12 +3504,13 @@ function serializeEntryMemo(entry) {
     ...(entry?.photos || {}),
   };
   const curingMeta = {
-    verifiedAt: entry?.verifiedAt || entry?.verified_at || entry?.uploadedAt || entry?.uploaded_at || "",
+    verifiedAt: entry?.verifiedAt || entry?.verified_at || "",
+    verifiedAtSource: entry?.verifiedAtSource || entry?.verified_at_source || "",
     capturedAt: entry?.capturedAt || entry?.captured_at || "",
     capturedAtSource: entry?.capturedAtSource || entry?.captured_at_source || "",
     sizeBytes: Number(entry?.sizeBytes || 0),
   };
-  if (curingMeta.verifiedAt || curingMeta.capturedAt || curingMeta.capturedAtSource || curingMeta.sizeBytes) {
+  if (curingMeta.verifiedAt || curingMeta.verifiedAtSource || curingMeta.capturedAt || curingMeta.capturedAtSource || curingMeta.sizeBytes) {
     photos[PHOTO_TYPES.CURING] = {
       ...(photos[PHOTO_TYPES.CURING] || {}),
       ...curingMeta,
@@ -2532,7 +3538,8 @@ function normalizeEntryMemo(memo) {
       photoUrl: memo?.photoUrl || memo?.photo_url || "",
       photoPath: memo?.photoPath || memo?.photo_path || "",
       uploadedAt: memo?.uploadedAt || memo?.uploaded_at || "",
-      verifiedAt: memo?.verifiedAt || memo?.verified_at || memo?.uploadedAt || memo?.uploaded_at || "",
+      verifiedAt: memo?.verifiedAt || memo?.verified_at || "",
+      verifiedAtSource: memo?.verifiedAtSource || memo?.verified_at_source || "",
       capturedAt: memo?.capturedAt || memo?.captured_at || memo?.takenAt || memo?.taken_at || "",
       capturedAtSource: memo?.capturedAtSource || memo?.captured_at_source || "",
       sizeBytes: memo?.sizeBytes || memo?.size_bytes || 0,
@@ -2547,7 +3554,8 @@ function normalizeEntryMemo(memo) {
     photoUrl: memo?.temperaturePhotoUrl || "",
     photoPath: memo?.temperaturePhotoPath || "",
     uploadedAt: memo?.temperatureUploadedAt || "",
-    verifiedAt: memo?.temperatureVerifiedAt || memo?.temperatureUploadedAt || "",
+    verifiedAt: memo?.temperatureVerifiedAt || "",
+    verifiedAtSource: memo?.temperatureVerifiedAtSource || "",
     capturedAt: memo?.temperatureCapturedAt || memo?.temperatureTakenAt || "",
     capturedAtSource: memo?.temperatureCapturedAtSource || "",
     sizeBytes: memo?.temperatureSizeBytes || 0,
@@ -2566,7 +3574,8 @@ function normalizePhotoMemo(photo, fallback = {}) {
     photoUrl: source.photoUrl || source.photo_url || fallback.photoUrl || "",
     photoPath: source.photoPath || source.photo_path || fallback.photoPath || "",
     uploadedAt: source.uploadedAt || source.uploaded_at || fallback.uploadedAt || "",
-    verifiedAt: source.verifiedAt || source.verified_at || fallback.verifiedAt || source.uploadedAt || source.uploaded_at || fallback.uploadedAt || "",
+    verifiedAt: source.verifiedAt || source.verified_at || fallback.verifiedAt || "",
+    verifiedAtSource: source.verifiedAtSource || source.verified_at_source || fallback.verifiedAtSource || "",
     capturedAt: source.capturedAt || source.captured_at || source.takenAt || source.taken_at || fallback.capturedAt || "",
     capturedAtSource: source.capturedAtSource || source.captured_at_source || fallback.capturedAtSource || "",
     sizeBytes: Number(source.sizeBytes || source.size_bytes || fallback.sizeBytes || 0),
@@ -2579,6 +3588,7 @@ function hasPhotoMemoData(photo) {
     photo?.photoPath ||
     photo?.uploadedAt ||
     photo?.verifiedAt ||
+    photo?.verifiedAtSource ||
     photo?.capturedAt ||
     photo?.capturedAtSource ||
     Number(photo?.sizeBytes || 0)
@@ -2589,6 +3599,7 @@ function renderAll() {
   renderPhotoTypeControls();
   renderDaySlotBlindButton();
   renderBoardListExpandButton();
+  renderWeatherAuditPanel();
   renderBoardList();
   renderSummary();
   if (!isFilePickerOpen) {
@@ -2602,6 +3613,7 @@ function renderMetaPreview() {
   renderPhotoTypeControls();
   renderDaySlotBlindButton();
   renderBoardListExpandButton();
+  renderWeatherAuditPanel();
   renderSummary();
   if (!isFilePickerOpen) {
     renderDayGrid();
@@ -2641,7 +3653,7 @@ async function endPhotoMutation() {
 }
 
 function shouldDeferRealtimeRefresh() {
-  return isFilePickerOpen || activePhotoMutationCount > 0;
+  return isFilePickerOpen || activePhotoMutationCount > 0 || isMetaSaveInProgress || boardSettingsSaveCount > 0;
 }
 
 async function flushPendingRealtimeRefresh() {
@@ -2665,16 +3677,39 @@ async function flushPendingRealtimeRefresh() {
   }
 }
 
+function getBoardCuringProgress(board) {
+  const entries = board?.entries || {};
+  const daySlots = getDaySlotList(entries, board?.settings);
+  const visibleDaySet = new Set(daySlots);
+  const total = Math.max(daySlots.length, 1);
+  const completed = countCompletedEntries(entries, PHOTO_TYPES.CURING, visibleDaySet, {
+    pourDate: board?.pourDate || "",
+  });
+  return {
+    completed,
+    total,
+    complete: completed >= total,
+  };
+}
+
+function getBoardResultStats(boards) {
+  const list = boards || [];
+  return {
+    total: list.length,
+    completed: list.filter((board) => getBoardCuringProgress(board).complete).length,
+  };
+}
+
 function renderBoardList() {
   cancelScheduledBoardListRender();
   renderBoardListExpandButton();
 
   const visibleBoards = getVisibleBoardList();
+  renderBoardResultControls(visibleBoards);
   if (!visibleBoards.length) {
-    const isSearching = Boolean(normalizeSearchText(boardSearchQuery));
     elements.boardList.innerHTML = `
       <div class="empty-list">
-        ${isSearching ? "검색 결과가 없습니다." : "등록된 사진대지가 없습니다."}
+        ${escapeHtml(getEmptyBoardListText())}
       </div>
     `;
     return;
@@ -2683,31 +3718,35 @@ function renderBoardList() {
   elements.boardList.innerHTML = visibleBoards
     .map((board) => {
       const active = board.shareCode === state.shareCode;
-      const boardEntries = board.entries || {};
-      const boardDaySlots = getDaySlotList(boardEntries);
-      const boardTemperatureSlots = getTemperatureSlotList(boardEntries);
-      const visibleDaySet = new Set(boardDaySlots);
+      const progress = getBoardCuringProgress(board);
+      const boardTemperatureSlots = getTemperatureSlotList(board.entries || {}, board.settings);
       const visibleTemperatureSet = new Set(boardTemperatureSlots);
-      const curingCount = countCompletedEntries(boardEntries, PHOTO_TYPES.CURING, visibleDaySet);
-      const temperatureCount = countCompletedEntries(boardEntries, PHOTO_TYPES.TEMPERATURE, visibleTemperatureSet);
-      const boardDaySlotCount = Math.max(boardDaySlots.length, 1);
+      const temperatureCount = countCompletedEntries(board.entries || {}, PHOTO_TYPES.TEMPERATURE, visibleTemperatureSet);
+      const rainAudit = getRainAuditStats([board]);
       return `
-        <div class="board-list-item ${active ? "active" : ""}" data-board-code="${escapeAttribute(board.shareCode)}">
-          <span class="board-date">${escapeHtml(formatListDate(board.pourDate))}</span>
-          <span class="board-part">${escapeHtml(board.pourPart)}</span>
-          <span class="board-counts">
-            <span class="board-count ${curingCount >= boardDaySlotCount ? "complete" : ""}">${curingCount}/${boardDaySlotCount} 양생</span>
-            ${
-              temperatureCount > 0
-                ? `<span class="board-count temperature">${temperatureCount}장 측정</span>`
-                : ""
-            }
-            ${
-              isAdminMode
-                ? `<button class="board-list-delete-button admin-only" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제" aria-label="${escapeAttribute(board.pourPart)} 사진대지 삭제">×</button>`
-                : ""
-            }
-          </span>
+        <div class="board-list-item ${active ? "active" : ""} ${progress.complete ? "" : "incomplete"}">
+          <button class="board-open-button" type="button" data-board-code="${escapeAttribute(board.shareCode)}" aria-current="${active ? "true" : "false"}" aria-label="${escapeAttribute(`${formatListDate(board.pourDate)} ${board.pourPart} 사진대지 열기`)}">
+            <span class="board-date">${escapeHtml(formatListDate(board.pourDate))}</span>
+            <span class="board-part">${escapeHtml(board.pourPart)}</span>
+            <span class="board-counts">
+              <span class="board-count ${progress.complete ? "complete" : ""}">${progress.completed}/${progress.total} 양생</span>
+              ${
+                temperatureCount > 0
+                  ? `<span class="board-count temperature">${temperatureCount}장 측정</span>`
+                  : ""
+              }
+              ${
+                isAdminMode && rainAudit.mismatch > 0
+                  ? `<span class="board-count weather-mismatch">우천 ${rainAudit.mismatch}건 확인</span>`
+                  : ""
+              }
+            </span>
+          </button>
+          ${
+            isAdminMode
+              ? `<button class="board-list-delete-button admin-only" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제" aria-label="${escapeAttribute(board.pourPart)} 사진대지 삭제">×</button>`
+              : ""
+          }
         </div>
       `;
     })
@@ -2735,10 +3774,281 @@ function renderBoardListExpandButton() {
 }
 
 function getVisibleBoardList() {
-  const query = normalizeSearchText(boardSearchQuery);
-  if (!query) return boardList;
+  const searchedBoards = getBoardSearchFilteredList();
+  const selection = getActiveBoardResultSelection();
+  const selectedBoards = selection
+    ? searchedBoards.filter((board) => getBoardResultGroupKey(board, selection.mode) === selection.key)
+    : searchedBoards;
 
-  return boardList.filter((board) => (board.searchText || normalizeSearchText(board.pourPart)).includes(query));
+  if (!isAdminMode || !weatherMismatchFilterActive) return selectedBoards;
+  return selectedBoards.filter((board) => getRainAuditStats([board]).mismatch > 0);
+}
+
+function getBoardSearchFilteredList(sourceBoards = boardList) {
+  const query = normalizeSearchText(boardSearchQuery);
+  if (!query) return sourceBoards;
+
+  return sourceBoards.filter((board) => (board.searchText || normalizeSearchText(board.pourPart)).includes(query));
+}
+
+function renderBoardResultControls(visibleBoards = getVisibleBoardList()) {
+  const mode = normalizeBoardResultViewMode(boardResultViewMode);
+  const searchedBoards = getBoardSearchFilteredList();
+  const groups = getBoardResultGroups(mode, searchedBoards);
+
+  renderBoardResultToggleButton();
+
+  if (elements.boardResultFilter) {
+    elements.boardResultFilter.hidden = !isBoardResultPanelOpen;
+  }
+
+  elements.boardResultViewButtons?.forEach((button) => {
+    const active = normalizeBoardResultViewMode(button.dataset.boardResultView) === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+
+  if (elements.boardResultCount) {
+    elements.boardResultCount.textContent = getBoardResultCountText(visibleBoards);
+  }
+  renderBoardResultSummary(groups);
+}
+
+function renderBoardResultToggleButton() {
+  if (!elements.boardResultToggleButton) return;
+
+  elements.boardResultToggleButton.setAttribute("aria-expanded", String(isBoardResultPanelOpen));
+  elements.boardResultToggleButton.setAttribute("aria-label", isBoardResultPanelOpen ? "사진대지 결과 닫기" : "사진대지 결과 보기");
+  elements.boardResultToggleButton.title = isBoardResultPanelOpen ? "사진대지 결과 닫기" : "사진대지 결과 보기";
+  elements.boardResultToggleButton.classList.toggle("active", isBoardResultPanelOpen);
+}
+
+function renderBoardResultSummary(groups) {
+  if (!elements.boardResultSummary) return;
+
+  if (!isBoardResultPanelOpen) {
+    elements.boardResultSummary.innerHTML = "";
+    return;
+  }
+
+  if (!groups.length) {
+    elements.boardResultSummary.innerHTML = `<div class="board-result-empty">${escapeHtml(getEmptyBoardListText())}</div>`;
+    return;
+  }
+
+  const activeSelection = getActiveBoardResultSelection();
+  const mode = normalizeBoardResultViewMode(boardResultViewMode);
+  elements.boardResultSummary.innerHTML = `
+    <div class="board-result-summary-grid">
+      ${groups
+        .map((group) => {
+          const active = activeSelection?.mode === mode && activeSelection?.key === group.key;
+          return `
+            <div class="board-result-cell ${active ? "active" : ""}">
+              <span class="board-result-label" title="${escapeAttribute(group.title)}">${escapeHtml(group.label)}</span>
+              <button class="board-result-count-button" type="button" data-board-result-group-key="${escapeAttribute(group.key)}" title="${escapeAttribute(formatBoardResultStatsTitle(group.title, group.stats))}">
+                <span>전체 ${group.stats.total}</span>
+                <span class="board-result-count-divider" aria-hidden="true">/</span>
+                <span>완료 ${group.stats.completed}</span>
+              </button>
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function handleBoardResultFilterClick(event) {
+  const groupButton = event.target.closest("[data-board-result-group-key]");
+  if (groupButton) {
+    handleBoardResultGroupClick(groupButton.dataset.boardResultGroupKey);
+    return;
+  }
+
+  const button = event.target.closest("[data-board-result-view]");
+  if (!button) return;
+
+  setBoardResultViewMode(button.dataset.boardResultView);
+}
+
+function toggleBoardResultPanel() {
+  isBoardResultPanelOpen = !isBoardResultPanelOpen;
+  if (!isBoardResultPanelOpen) {
+    boardResultSelectedGroup = null;
+  }
+  saveBoardResultPanelOpen();
+  renderBoardList();
+}
+
+function setBoardResultViewMode(mode) {
+  const nextMode = normalizeBoardResultViewMode(mode);
+  if (nextMode === boardResultViewMode) return;
+
+  boardResultViewMode = nextMode;
+  boardResultSelectedGroup = null;
+  saveBoardResultPreference(BOARD_RESULT_VIEW_STORAGE_KEY, boardResultViewMode);
+  renderBoardList();
+}
+
+function handleBoardResultGroupClick(groupKey) {
+  const mode = normalizeBoardResultViewMode(boardResultViewMode);
+  const group = getBoardResultGroups(mode, getBoardSearchFilteredList()).find((item) => item.key === groupKey);
+  if (!group || !group.boards.length) return;
+
+  if (group.boards.length === 1) {
+    openBoard(group.boards[0].shareCode).catch(console.error);
+    return;
+  }
+
+  boardResultSelectedGroup = { mode, key: group.key };
+  renderBoardList();
+  elements.boardList?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  showToast(`${formatBoardResultStatsTitle(group.title, group.stats)}을 목록에 표시했습니다.`);
+}
+
+function getActiveBoardResultSelection() {
+  if (!isBoardResultPanelOpen || !boardResultSelectedGroup) return null;
+
+  const mode = normalizeBoardResultViewMode(boardResultViewMode);
+  if (boardResultSelectedGroup.mode !== mode) return null;
+  return boardResultSelectedGroup;
+}
+
+function getBoardResultGroups(mode = boardResultViewMode, sourceBoards = getBoardSearchFilteredList()) {
+  const normalizedMode = normalizeBoardResultViewMode(mode);
+  if (normalizedMode === BOARD_RESULT_VIEWS.ALL) {
+    return [
+      {
+        key: BOARD_RESULT_VIEWS.ALL,
+        label: "전체",
+        title: "전체",
+        boards: sourceBoards,
+        stats: getBoardResultStats(sourceBoards),
+      },
+    ].filter((group) => group.boards.length);
+  }
+
+  const groupMap = new Map();
+  sourceBoards.forEach((board) => {
+    const key = getBoardResultGroupKey(board, normalizedMode);
+    if (!key) return;
+
+    if (!groupMap.has(key)) {
+      groupMap.set(key, {
+        key,
+        label: getBoardResultGroupLabel(normalizedMode, key),
+        title: getBoardResultGroupTitle(normalizedMode, key),
+        boards: [],
+        stats: { total: 0, completed: 0 },
+      });
+    }
+    groupMap.get(key).boards.push(board);
+  });
+
+  return Array.from(groupMap.values())
+    .map((group) => ({
+      ...group,
+      stats: getBoardResultStats(group.boards),
+    }))
+    .sort((a, b) => b.key.localeCompare(a.key));
+}
+
+function getBoardResultGroupKey(board, mode = boardResultViewMode) {
+  const normalizedMode = normalizeBoardResultViewMode(mode);
+  if (normalizedMode === BOARD_RESULT_VIEWS.ALL) return BOARD_RESULT_VIEWS.ALL;
+  if (normalizedMode === BOARD_RESULT_VIEWS.MONTH) return getBoardDateMonth(board.pourDate);
+  if (normalizedMode === BOARD_RESULT_VIEWS.DAY) return normalizeBoardResultDay(board.pourDate);
+  return "";
+}
+
+function getBoardDateMonth(dateValue) {
+  const day = normalizeBoardResultDay(dateValue);
+  return day ? day.slice(0, 7) : "";
+}
+
+function getBoardResultCountText(visibleBoards = getVisibleBoardList()) {
+  return formatBoardResultStatsTitle(getBoardResultScopeLabel(), getBoardResultStats(visibleBoards));
+}
+
+function getBoardResultScopeLabel() {
+  const mode = normalizeBoardResultViewMode(boardResultViewMode);
+  const selection = getActiveBoardResultSelection();
+  if (selection) return getBoardResultGroupTitle(mode, selection.key);
+  if (mode === BOARD_RESULT_VIEWS.MONTH) return "월별";
+  if (mode === BOARD_RESULT_VIEWS.DAY) return "일자별";
+  return "전체";
+}
+
+function getEmptyBoardListText() {
+  if (isAdminMode && weatherMismatchFilterActive) return "기상청 0mm 불일치 대지가 없습니다.";
+  if (normalizeSearchText(boardSearchQuery)) return "검색 결과가 없습니다.";
+  if (getActiveBoardResultSelection()) return `${getBoardResultScopeLabel()} 결과가 없습니다.`;
+  return "등록된 사진대지가 없습니다.";
+}
+
+function getBoardResultGroupLabel(mode, key) {
+  const normalizedMode = normalizeBoardResultViewMode(mode);
+  if (normalizedMode === BOARD_RESULT_VIEWS.MONTH) return formatBoardResultMonthShort(key);
+  if (normalizedMode === BOARD_RESULT_VIEWS.DAY) return formatBoardResultDayShort(key);
+  return "전체";
+}
+
+function getBoardResultGroupTitle(mode, key) {
+  const normalizedMode = normalizeBoardResultViewMode(mode);
+  if (normalizedMode === BOARD_RESULT_VIEWS.MONTH) return formatBoardResultMonth(key);
+  if (normalizedMode === BOARD_RESULT_VIEWS.DAY) return formatBoardResultDay(key);
+  return "전체";
+}
+
+function formatBoardResultStatsTitle(label, stats) {
+  const resultStats = stats || { total: 0, completed: 0 };
+  if (label === "전체") {
+    return `전체 ${resultStats.total}건 / 완료 ${resultStats.completed}건`;
+  }
+  return `${label} 전체 ${resultStats.total}건 / 완료 ${resultStats.completed}건`;
+}
+
+function normalizeBoardResultViewMode(mode) {
+  return Object.values(BOARD_RESULT_VIEWS).includes(mode) ? mode : BOARD_RESULT_VIEWS.ALL;
+}
+
+function normalizeBoardResultMonth(value) {
+  const text = String(value || "").trim();
+  return /^\d{4}-\d{2}$/.test(text) ? text : "";
+}
+
+function normalizeBoardResultDay(value) {
+  const text = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : "";
+}
+
+function loadBoardResultPanelOpen() {
+  try {
+    return localStorage.getItem(BOARD_RESULT_PANEL_OPEN_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function loadBoardResultViewMode() {
+  try {
+    return normalizeBoardResultViewMode(localStorage.getItem(BOARD_RESULT_VIEW_STORAGE_KEY));
+  } catch {
+    return BOARD_RESULT_VIEWS.ALL;
+  }
+}
+
+function saveBoardResultPanelOpen() {
+  saveBoardResultPreference(BOARD_RESULT_PANEL_OPEN_STORAGE_KEY, isBoardResultPanelOpen ? "1" : "0");
+}
+
+function saveBoardResultPreference(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // 개인 보기 설정 저장 실패는 무시합니다.
+  }
 }
 
 function scheduleBoardListRender() {
@@ -2783,6 +4093,7 @@ function toggleBoardSearch() {
 
 function clearBoardSearch() {
   boardSearchQuery = "";
+  boardResultSelectedGroup = null;
   elements.boardSearchInput.value = "";
   renderBoardList();
   elements.boardSearchInput.focus();
@@ -2793,6 +4104,7 @@ function handleBoardSearchInput() {
   if (applyAdminCode(value)) return;
 
   boardSearchQuery = value;
+  boardResultSelectedGroup = null;
   scheduleBoardListRender();
 }
 
@@ -2825,15 +4137,14 @@ function renderSummary() {
   elements.summaryList.innerHTML = days(photoType)
     .map((day) => {
       const entry = getEntry(day);
-      const hasPhoto = hasEntryPhoto(entry, photoType);
       const rainHold = photoType === PHOTO_TYPES.CURING && isRainHoldEntry(entry);
       const slotLabel = getPhotoSlotLabel(day, photoType);
-      const statusText = hasPhoto ? "등록" : rainHold ? "우천대기" : "미등록";
+      const completion = getEntryCompletionDisplay(entry, photoType, day, state.pourDate);
       return `
-        <button class="summary-item ${hasPhoto ? "done" : ""} ${rainHold ? "rain-hold" : ""}" type="button" data-summary-day="${day}">
+        <button class="summary-item ${completion.complete ? "done" : ""} ${rainHold ? "rain-hold" : ""}" type="button" data-summary-day="${day}">
           <strong>${escapeHtml(slotLabel)}</strong>
           <small>${escapeHtml(getPhotoSlotCompactLabel(day, photoType))}</small>
-          <span class="summary-status">${statusText}</span>
+          <span class="summary-status">${escapeHtml(completion.statusText)}</span>
         </button>
       `;
     })
@@ -2866,8 +4177,9 @@ function renderDayGrid() {
       const emptyPhotoText = getEmptyPhotoText(day, photoType);
       const slotLabel = getPhotoSlotLabel(day, photoType);
       const slotDateLabel = getPhotoSlotDateLabel(day, photoType);
+      const completion = getEntryCompletionDisplay(entry, photoType, day, state.pourDate);
       return `
-        <article class="day-card ${hasPhoto ? "complete" : ""} ${rainHold ? "rain-hold" : ""}" data-day-card="${day}">
+        <article class="day-card ${completion.complete ? "complete" : ""} ${hasPhoto && !completion.complete ? "pre-registered" : ""} ${rainHold ? "rain-hold" : ""}" data-day-card="${day}">
           <div class="day-card-header">
             <h3>${escapeHtml(slotLabel)}</h3>
             ${
@@ -2890,6 +4202,7 @@ function renderDayGrid() {
                 : ""
             }
             <span class="date-pill">${escapeHtml(slotDateLabel)}</span>
+            ${renderWeatherProof(day, rainHold)}
           </div>
           <div class="photo-preview" data-photo-slot="${day}">
             ${
@@ -2897,7 +4210,7 @@ function renderDayGrid() {
                 ? `<button class="photo-preview-button" type="button" data-preview-day="${day}" data-preview-type="${escapeAttribute(photoType)}" title="${escapeAttribute(slotLabel)} 사진 크게 보기">
                     <img src="${escapeAttribute(photo.photoUrl)}" alt="${escapeAttribute(slotLabel)} ${escapeAttribute(typeConfig.label)} 사진" loading="lazy" decoding="async">
                   </button>`
-                : `<button class="empty-photo ${rainHold ? "rain-hold" : ""}" type="button" data-paste-day="${day}" title="여기를 누른 뒤 Ctrl+V로 붙여넣기"><span>${escapeHtml(emptyPhotoText)}</span></button>`
+                : `<button class="empty-photo ${rainHold ? "rain-hold" : ""}" type="button" data-paste-day="${day}" title="여기를 누른 뒤 Ctrl+V로 붙여넣기" aria-label="${escapeAttribute(`${slotLabel} ${typeConfig.label} 사진 붙여넣기 대상 선택`)}"><span>${escapeHtml(emptyPhotoText)}</span></button>`
             }
           </div>
           <div class="day-card-body">
@@ -2912,7 +4225,7 @@ function renderDayGrid() {
               </div>
               ${
                 hasPhoto
-                  ? `<button class="small-button danger-button" type="button" data-delete-day="${day}" data-delete-type="${escapeAttribute(photoType)}">
+                  ? `<button class="small-button danger-button" type="button" data-delete-day="${day}" data-delete-type="${escapeAttribute(photoType)}" aria-label="${escapeAttribute(`${slotLabel} ${typeConfig.label} 사진 삭제`)}">
                       <span class="button-icon" aria-hidden="true">×</span>
                       <span>삭제</span>
                     </button>`
@@ -2993,8 +4306,21 @@ function getPrintTextLengthScore(text) {
 
 function renderUploadedMeta(photo) {
   if (!photo.photoUrl) return "";
-  const verifiedTime = photo.verifiedAt || photo.uploadedAt ? formatDateTime(photo.verifiedAt || photo.uploadedAt) : "";
-  return verifiedTime ? `검증 ${escapeHtml(verifiedTime)} · 자동 압축` : "검증일시 없음 · 자동 압축";
+  const verifiedTime = photo.verifiedAt ? formatDateTime(photo.verifiedAt) : "";
+  const uploadedTime = photo.uploadedAt ? formatDateTime(photo.uploadedAt) : "";
+  if (photo.verifiedAtSource === "server" && verifiedTime) {
+    return `서버 검증 ${escapeHtml(verifiedTime)} · 자동 압축`;
+  }
+  if (photo.verifiedAtSource === "device" && verifiedTime) {
+    return `기기 등록 ${escapeHtml(verifiedTime)} · 서버 검증 아님 · 자동 압축`;
+  }
+  if (verifiedTime) {
+    return `기존 등록 ${escapeHtml(verifiedTime)} · 검증 출처 미확인 · 자동 압축`;
+  }
+  if (uploadedTime) {
+    return `등록 ${escapeHtml(uploadedTime)} · 서버 검증 전 · 자동 압축`;
+  }
+  return "등록일시 없음 · 서버 검증 전 · 자동 압축";
 }
 
 function openPhotoViewer(day, photoType = activePhotoType) {
@@ -3003,10 +4329,12 @@ function openPhotoViewer(day, photoType = activePhotoType) {
   const photo = getTypedPhoto(getEntry(day), normalizedType);
   if (!photo.photoUrl) return;
 
+  lastPhotoViewerTrigger = document.activeElement;
   elements.photoViewerImage.src = photo.photoUrl;
   elements.photoViewerImage.alt = `${getPhotoSlotLabel(day, normalizedType)} ${typeConfig.label} 사진`;
   elements.photoViewer.hidden = false;
   document.body.classList.add("viewer-open");
+  elements.photoViewerClose.focus();
 }
 
 function closePhotoViewerOnBackdrop(event) {
@@ -3016,10 +4344,15 @@ function closePhotoViewerOnBackdrop(event) {
 }
 
 function closePhotoViewer() {
+  const wasOpen = !elements.photoViewer.hidden;
   elements.photoViewer.hidden = true;
   elements.photoViewerImage.removeAttribute("src");
   elements.photoViewerImage.alt = "";
   document.body.classList.remove("viewer-open");
+  if (wasOpen && lastPhotoViewerTrigger?.isConnected && typeof lastPhotoViewerTrigger.focus === "function") {
+    lastPhotoViewerTrigger.focus();
+  }
+  lastPhotoViewerTrigger = null;
 }
 
 function getPrintImageSignature() {
@@ -3033,6 +4366,7 @@ function getPrintImageSignature() {
       photo.photoUrl || "",
       photo.uploadedAt || "",
       photo.verifiedAt || "",
+      photo.verifiedAtSource || "",
       photo.capturedAt || "",
       photoType === PHOTO_TYPES.CURING && isRainHoldEntry(entry),
     ];
@@ -3045,6 +4379,7 @@ function getPrintImageSignature() {
     pourDate: state.pourDate || "",
     printSlots,
     entries,
+    dayLabels: normalizeBoardSettings(state.settings).dayLabels,
     printDayLabelBlind: loadPrintDayLabelBlindMode(),
   });
 }
@@ -3456,8 +4791,13 @@ async function handlePrint() {
     showToast("먼저 사진대지를 선택하거나 만들어 주세요.");
     return;
   }
+  if (activePhotoMutationCount > 0) {
+    showToast("현재 저장 작업이 끝난 뒤 PDF를 만들어 주세요.");
+    return;
+  }
 
   elements.printButton.disabled = true;
+  beginPhotoMutation();
   showToast("출력 파일을 준비하는 중입니다.");
   try {
     const { images, failedCount } = await getPrintPageImages();
@@ -3484,6 +4824,7 @@ async function handlePrint() {
     showToast("출력 파일을 만들지 못했습니다.");
   } finally {
     elements.printButton.disabled = false;
+    await endPhotoMutation();
   }
 }
 
@@ -3652,14 +4993,20 @@ function writeRasterPrintDocument(printWindow, images) {
 
 async function createNewBoard() {
   if (activePhotoMutationCount > 0) {
-    showToast("사진 등록이 끝난 뒤 새 사진대지를 만들어 주세요.");
+    showToast("현재 저장 작업이 끝난 뒤 새 사진대지를 만들어 주세요.");
     return;
   }
 
   endFilePickNow();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
-  boardLoadToken += 1;
+  const token = ++boardLoadToken;
+  if (state.shareCode) {
+    await saveMeta();
+    if (token !== boardLoadToken) return;
+  }
+  await boardSettingsSaveChain;
+  if (token !== boardLoadToken) return;
   activePhotoType = DEFAULT_PHOTO_TYPE;
 
   const shareCode = createShareCode();
@@ -3672,8 +5019,10 @@ async function createNewBoard() {
     pourPart: "",
     pourDate: toDateInputValue(new Date()),
     entries: {},
+    settings: getLegacyBoardSettings(),
   };
   lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
+  boardResultSelectedGroup = null;
 
   if (dbClient) {
     await loadCloudBoard({ createIfMissing: true });
@@ -3702,7 +5051,7 @@ async function deleteBoardByShareCode(shareCode) {
     return;
   }
   if (activePhotoMutationCount > 0) {
-    showToast("사진 등록이 끝난 뒤 사진대지를 삭제해 주세요.");
+    showToast("현재 저장 작업이 끝난 뒤 사진대지를 삭제해 주세요.");
     return;
   }
 
@@ -3737,10 +5086,13 @@ async function deleteBoardByShareCode(shareCode) {
   endFilePickNow();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
+  if (metaSavePromise) await metaSavePromise;
+  await boardSettingsSaveChain;
 
   const deletedShareCode = shareCode;
   const deletingCurrent = state.shareCode === deletedShareCode;
   const nextShareCode = boardList.find((board) => board.shareCode !== deletedShareCode)?.shareCode || "";
+  let deleteResult = { deleted: false, cleanupPending: false, status: "active" };
 
   try {
     if (target.boardId && dbClient) {
@@ -3749,19 +5101,45 @@ async function deleteBoardByShareCode(shareCode) {
         realtimeChannel = null;
       }
 
-      await deleteCloudBoardTarget(target);
+      deleteResult = await deleteCloudBoardTarget(target);
     } else {
       localStorage.removeItem(LOCAL_PREFIX + deletedShareCode);
+      deleteResult = { deleted: true, cleanupPending: false, status: "deleted" };
+    }
+
+    if (deleteResult.status === "unknown") {
+      if (deletingCurrent && dbClient && state.boardId && !realtimeChannel) {
+        await subscribeToChanges().catch(console.error);
+      }
+      showToast("삭제 결과를 확인하지 못했습니다. 연결이 복구되면 대지 목록에서 상태를 다시 확인해 주세요.");
+      return;
+    }
+    if (!deleteResult.deleted) {
+      throw new Error("Board deletion was not confirmed.");
     }
     localStorage.removeItem(META_DRAFT_PREFIX + deletedShareCode);
+    localStorage.removeItem(BOARD_SETTINGS_FALLBACK_PREFIX + deletedShareCode);
   } catch (error) {
     console.error(error);
-    showToast("사진대지 삭제에 실패했습니다.");
+    if (deletingCurrent && dbClient && state.boardId && !realtimeChannel) {
+      await subscribeToChanges().catch(console.error);
+    }
+    showToast(
+      isBackendUpgradeRequiredError(error)
+        ? "서버 업데이트가 필요해 사진대지를 삭제하지 않았습니다. 데이터베이스 업데이트 후 다시 시도해 주세요."
+        : "사진대지 삭제에 실패했습니다.",
+    );
     return;
   }
 
   saveHiddenBoardCode(deletedShareCode);
-  await loadBoardList();
+  boardList = boardList.filter((board) => board.shareCode !== deletedShareCode);
+  try {
+    await loadBoardList();
+  } catch (error) {
+    console.warn("Deleted board list refresh failed", error);
+    pendingRealtimeRefresh = Boolean(dbClient);
+  }
 
   if (deletingCurrent) {
     state.shareCode = "";
@@ -3772,14 +5150,22 @@ async function deleteBoardByShareCode(shareCode) {
     } else {
       resetCurrentBoard();
       syncUrlToCurrentBoard();
-      await loadBoardList();
+      try {
+        await loadBoardList();
+      } catch (error) {
+        console.warn("Empty board list refresh failed", error);
+      }
       renderAll();
     }
   } else {
     renderAll();
   }
 
-  showToast("사진대지를 삭제했습니다.");
+  showToast(
+    deleteResult.cleanupPending
+      ? "사진대지는 삭제 처리했습니다. 남은 서버 파일은 다음 정리 때 다시 처리됩니다."
+      : "사진대지를 삭제했습니다."
+  );
 }
 
 async function loadBoardDeleteTarget(shareCode) {
@@ -3824,7 +5210,7 @@ async function loadBoardDeleteTarget(shareCode) {
   const listBoard = boardList.find((board) => board.shareCode === shareCode);
   const { data, error } = await dbClient
     .from("photo_boards")
-    .select("id, share_code, project_name, pour_part")
+    .select("*")
     .eq("share_code", shareCode)
     .maybeSingle();
   if (error) throw error;
@@ -3841,9 +5227,7 @@ async function loadBoardDeleteTarget(shareCode) {
     .from("photo_entries")
     .select("*")
     .eq("board_id", board.id);
-  if (entryError) {
-    console.warn("Board delete entry lookup failed", entryError);
-  }
+  if (entryError) throw entryError;
 
   (entryRows || []).forEach((row) => {
     const memo = parseEntryMemo(row.memo);
@@ -3852,7 +5236,8 @@ async function loadBoardDeleteTarget(shareCode) {
       photoUrl: row.photo_url || "",
       photoPath: row.photo_path || "",
       uploadedAt: row.uploaded_at || "",
-      verifiedAt: memo.photos?.[PHOTO_TYPES.CURING]?.verifiedAt || row.uploaded_at || "",
+      verifiedAt: memo.photos?.[PHOTO_TYPES.CURING]?.verifiedAt || "",
+      verifiedAtSource: memo.photos?.[PHOTO_TYPES.CURING]?.verifiedAtSource || "",
       capturedAt: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAt || "",
       capturedAtSource: memo.photos?.[PHOTO_TYPES.CURING]?.capturedAtSource || "",
       rainHold: memo.rainHold,
@@ -3869,78 +5254,136 @@ async function loadBoardDeleteTarget(shareCode) {
 }
 
 async function deleteCloudBoardTarget(target) {
-  if (!dbClient || !target?.boardId) return false;
+  if (!dbClient || !target?.boardId) {
+    return { deleted: false, cleanupPending: false, status: "active" };
+  }
 
-  const photoPaths = collectBoardPhotoPaths(target.entries || {});
-  let hardDeleteError = null;
+  const markStatus = await markCloudBoardDeletedAtomically(target.boardId);
+  if (markStatus === "unknown") {
+    return { deleted: false, cleanupPending: false, status: "unknown" };
+  }
+  if (markStatus === "missing") {
+    return { deleted: true, cleanupPending: false, status: "deleted" };
+  }
+
+  let latestEntries = null;
+  try {
+    latestEntries = await loadCloudBoardEntriesForDeletion(target.boardId);
+  } catch (error) {
+    console.warn("Deleted board entry cleanup deferred", error);
+    return { deleted: true, cleanupPending: true, status: "deleted" };
+  }
+  const photoPaths = collectBoardPhotoPaths(latestEntries, target.shareCode);
 
   try {
-    const { error: entryError } = await dbClient
-      .from("photo_entries")
-      .delete()
-      .eq("board_id", target.boardId);
-
-    if (!entryError) {
-      const { error: boardError } = await dbClient
-        .from("photo_boards")
-        .delete()
-        .eq("id", target.boardId);
-      hardDeleteError = boardError;
-    } else {
-      hardDeleteError = entryError;
-    }
-  } catch (error) {
-    hardDeleteError = error;
-  }
-
-  const remainingAfterHardDelete = await fetchCloudBoardDeleteRecord(target.boardId);
-  if (!remainingAfterHardDelete) {
     await removeBoardStoragePaths(photoPaths);
-    return true;
-  }
-  if (hardDeleteError) {
-    console.warn("Hard board delete failed; using soft delete marker", hardDeleteError);
-  } else {
-    console.warn("Hard board delete did not remove the board; using soft delete marker");
+  } catch (error) {
+    console.warn("Board storage cleanup deferred", error);
+    return { deleted: true, cleanupPending: true, status: "deleted" };
   }
 
-  await markCloudBoardAsDeleted(target);
-  return true;
+  if (atomicDeletePurgeRpcAvailable === false) {
+    return { deleted: true, cleanupPending: true, status: "deleted" };
+  }
+
+  let data = null;
+  let error = null;
+  try {
+    ({ data, error } = await dbClient.rpc("purge_photo_board", { p_board_id: target.boardId }));
+  } catch (requestError) {
+    error = requestError;
+  }
+  if (error && isMissingBackendFeature(error, "purge_photo_board")) {
+    atomicDeletePurgeRpcAvailable = false;
+    console.warn("Atomic board purge RPC is unavailable; cleanup is paused until the server is updated.");
+    return { deleted: true, cleanupPending: true, status: "deleted" };
+  }
+  if (error) {
+    atomicDeletePurgeRpcAvailable = true;
+    console.warn("Atomic board purge deferred", error);
+    return { deleted: true, cleanupPending: true, status: "deleted" };
+  }
+
+  atomicDeletePurgeRpcAvailable = true;
+  if (data === false) {
+    try {
+      const remaining = await fetchCloudBoardDeleteRecord(target.boardId);
+      return {
+        deleted: !remaining || isDeletedBoardRecord(remaining),
+        cleanupPending: Boolean(remaining),
+        status: !remaining || isDeletedBoardRecord(remaining) ? "deleted" : "active",
+      };
+    } catch (verificationError) {
+      console.warn("Board purge result could not be verified", verificationError);
+      return { deleted: true, cleanupPending: true, status: "deleted" };
+    }
+  }
+  return { deleted: true, cleanupPending: false, status: "deleted" };
+}
+
+async function markCloudBoardDeletedAtomically(boardId) {
+  if (atomicDeleteMarkRpcAvailable === false) {
+    throw createBackendUpgradeRequiredError("mark_photo_board_deleted");
+  }
+
+  let error = null;
+  try {
+    ({ error } = await dbClient.rpc("mark_photo_board_deleted", { p_board_id: boardId }));
+  } catch (requestError) {
+    error = requestError;
+  }
+
+  if (error && isMissingBackendFeature(error, "mark_photo_board_deleted")) {
+    atomicDeleteMarkRpcAvailable = false;
+    throw createBackendUpgradeRequiredError("mark_photo_board_deleted");
+  }
+  if (!error) {
+    atomicDeleteMarkRpcAvailable = true;
+    return "marked";
+  }
+
+  atomicDeleteMarkRpcAvailable = true;
+  try {
+    const verified = await fetchCloudBoardDeleteRecord(boardId);
+    if (!verified) return "missing";
+    if (isDeletedBoardRecord(verified)) return "marked";
+  } catch (verificationError) {
+    console.warn("Board tombstone result could not be verified", verificationError);
+    return "unknown";
+  }
+  throw error;
+}
+
+function createBackendUpgradeRequiredError(featureName) {
+  const error = new Error(`Backend update required: ${featureName}`);
+  error.code = "BACKEND_UPGRADE_REQUIRED";
+  return error;
+}
+
+function isBackendUpgradeRequiredError(error) {
+  return error?.code === "BACKEND_UPGRADE_REQUIRED";
+}
+
+async function loadCloudBoardEntriesForDeletion(boardId) {
+  const { data, error } = await dbClient
+    .from("photo_entries")
+    .select("*")
+    .eq("board_id", boardId);
+  if (error) throw error;
+  return data || [];
 }
 
 async function fetchCloudBoardDeleteRecord(boardId) {
   const { data, error } = await dbClient
     .from("photo_boards")
-    .select("id, share_code, project_name, pour_part, pour_date")
+    .select("*")
     .eq("id", boardId)
     .maybeSingle();
   if (error) throw error;
   return data || null;
 }
 
-async function markCloudBoardAsDeleted(target) {
-  const now = new Date().toISOString();
-  const deletedPourPart = `[deleted] ${target.pourPart || ""}`.trim();
-  const { data, error } = await dbClient
-    .from("photo_boards")
-    .update({
-      project_name: DELETED_BOARD_PROJECT_NAME,
-      pour_part: deletedPourPart,
-      updated_at: now,
-    })
-    .eq("id", target.boardId)
-    .select("id, share_code, project_name, pour_part, pour_date")
-    .maybeSingle();
-  if (error) throw error;
-  if (data && isDeletedBoardRecord(data)) return true;
-
-  const verified = await fetchCloudBoardDeleteRecord(target.boardId);
-  if (!verified || isDeletedBoardRecord(verified)) return true;
-
-  throw new Error("Board delete marker was not applied.");
-}
-
-function collectBoardPhotoPaths(entries) {
+function collectBoardPhotoPaths(entries, shareCode = "") {
   const paths = new Set();
   getEntryItems(entries).forEach(({ entry }) => {
     Object.values(PHOTO_TYPES).forEach((photoType) => {
@@ -3948,33 +5391,39 @@ function collectBoardPhotoPaths(entries) {
       if (photo.photoPath) paths.add(photo.photoPath);
     });
   });
+  if (shareCode) {
+    paths.add(`${shareCode}/pdf/${PHOTO_TYPES.CURING}.pdf`);
+    paths.add(`${shareCode}/pdf/${PHOTO_TYPES.TEMPERATURE}.pdf`);
+  }
   return Array.from(paths);
 }
 
 async function removeBoardStoragePaths(paths) {
-  if (!dbClient || !paths.length) return;
+  if (!dbClient || !paths.length) return true;
   const { error } = await dbClient.storage.from(config.bucket).remove(paths);
-  if (error) {
-    console.warn("Board photo storage cleanup failed", error);
-  }
+  if (error) throw error;
+  return true;
 }
 
 async function openBoard(shareCode) {
   if (!shareCode) return;
   if (activePhotoMutationCount > 0) {
-    showToast("사진 등록이 끝난 뒤 다른 타설부위를 열어 주세요.");
+    showToast("현재 저장 작업이 끝난 뒤 다른 타설부위를 열어 주세요.");
     return;
   }
 
+  const token = ++boardLoadToken;
   endFilePickNow();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
   activePhotoType = DEFAULT_PHOTO_TYPE;
   if (state.shareCode && shareCode !== state.shareCode) {
     await saveMeta();
+    if (token !== boardLoadToken) return;
   }
+  await boardSettingsSaveChain;
+  if (token !== boardLoadToken) return;
 
-  const token = ++boardLoadToken;
   const selectedBoard = boardList.find((board) => board.shareCode === shareCode);
   clearBoardUrlParam();
   state = {
@@ -3985,6 +5434,9 @@ async function openBoard(shareCode) {
     pourDate: selectedBoard?.pourDate || toDateInputValue(new Date()),
     createdAt: selectedBoard?.createdAt || "",
     entries: {},
+    settings: normalizeBoardSettings(selectedBoard?.settings, {
+      fallback: loadBoardSettingsFallback(shareCode) || getLegacyBoardSettings(),
+    }),
   };
   syncInputsFromState();
   closePhotoViewer();
@@ -4159,6 +5611,41 @@ function formatListDate(value) {
   const day = String(date.getDate()).padStart(2, "0");
   const weekday = date.toLocaleDateString("ko-KR", { weekday: "short" });
   return `${month}.${day}.(${weekday})`;
+}
+
+function formatBoardResultMonth(value) {
+  const month = normalizeBoardResultMonth(value);
+  if (!month) return "월별";
+  const [year, monthNumber] = month.split("-");
+  return `${year}년 ${Number(monthNumber)}월`;
+}
+
+function formatBoardResultMonthShort(value) {
+  const month = normalizeBoardResultMonth(value);
+  if (!month) return "월";
+  const [, monthNumber] = month.split("-");
+  return `${Number(monthNumber)}월`;
+}
+
+function formatBoardResultDay(value) {
+  const day = normalizeBoardResultDay(value);
+  if (!day) return "일자별";
+  const date = new Date(`${day}T00:00:00`);
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
+  const dateNumber = date.getDate();
+  const weekday = date.toLocaleDateString("ko-KR", { weekday: "short" });
+  return `${year}년 ${month}월 ${dateNumber}일(${weekday})`;
+}
+
+function formatBoardResultDayShort(value) {
+  const day = normalizeBoardResultDay(value);
+  if (!day) return "일자";
+  const date = new Date(`${day}T00:00:00`);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const dateNumber = String(date.getDate()).padStart(2, "0");
+  const weekday = date.toLocaleDateString("ko-KR", { weekday: "short" });
+  return `${month}.${dateNumber}.(${weekday})`;
 }
 
 function formatDateTime(value) {
