@@ -1,4 +1,0 @@
-project_id = "fgktnhtcswxczbnrfbai"
-
-[functions.kma-weather]
-verify_jwt = false
