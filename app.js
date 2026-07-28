@@ -72,7 +72,15 @@ const IMAGE_QUALITY = 0.7;
 const PHOTO_CACHE_CONTROL_SECONDS = "31536000";
 const REALTIME_REFRESH_DEBOUNCE_MS = 250;
 const PRINT_PAGE_GROUP_SIZE = 2; // 사진대지 1페이지당 일차 수(2일차 = 사진 2장). 일차 수에 맞춰 페이지가 자동 증감합니다.
-const PRINT_MM_SCALE = 6;
+// 인쇄본은 6배(1260x1782px)로 그리고, 화면 미리보기는 3배로만 그립니다.
+// 미리보기까지 6배로 그리면 페이지당 224만 화소를 매번 다시 인코딩하게 되어 입력이 멈춥니다.
+const PRINT_MM_SCALE_EXPORT = 6;
+const PRINT_MM_SCALE_PREVIEW = 3;
+const PRINT_EXPORT_JPEG_QUALITY = 0.92;
+const PRINT_PREVIEW_JPEG_QUALITY = 0.8;
+// 타설부위를 타이핑하는 동안 미리보기를 계속 다시 그리지 않도록 여유를 둡니다.
+const PRINT_PREVIEW_DEBOUNCE_MS = 400;
+let printMmScale = PRINT_MM_SCALE_EXPORT;
 const PRINT_PAGE_WIDTH_MM = 210;
 const PRINT_PAGE_HEIGHT_MM = 297;
 const PRINT_TABLE_WIDTH_MM = 152.02;
@@ -357,7 +365,13 @@ function bindEvents() {
       pullMetaFromInputs();
       saveMetaDraft();
       queueMetaSave();
-      renderMetaPreview();
+      // 현장명·타설부위는 일차 카드에 영향이 없습니다.
+      // 글자 하나마다 dayGrid를 통째로 다시 만들면 사진 <img>가 매번 재생성돼 입력이 끊깁니다.
+      if (input === elements.pourDateInput) {
+        renderMetaPreview();
+      } else {
+        renderPrintArea();
+      }
     });
     input.addEventListener("change", flushMetaSave);
     input.addEventListener("blur", flushMetaSave);
@@ -1200,6 +1214,26 @@ async function loadBoardList() {
   await reconcileCurrentBoardEntries();
 }
 
+// 내 저장이 끝난 직후에는 전체 목록을 다시 받을 이유가 없습니다.
+// (전체 재조회는 대지가 쌓일수록 선형으로 느려져 타이핑·사진 저장이 멈추던 원인입니다.)
+// 목록에 아직 없는 새 대지일 때만 전체를 받습니다.
+async function syncCurrentBoardIntoList({ resort = false } = {}) {
+  if (!state.shareCode) return;
+
+  if (!boardList.some((board) => board.shareCode === state.shareCode)) {
+    try {
+      await loadBoardList();
+    } catch (error) {
+      console.warn("Board list refresh failed", error);
+      pendingRealtimeRefresh = Boolean(dbClient);
+    }
+    return;
+  }
+
+  updateCurrentBoardSummaryFromState();
+  if (resort) sortBoardListInPlace();
+}
+
 function loadHiddenBoardCodes() {
   try {
     const parsed = JSON.parse(localStorage.getItem(HIDDEN_BOARD_CODES_STORAGE_KEY) || "[]");
@@ -1246,7 +1280,9 @@ async function loadCloudBoardList() {
     return board.share_code && board.pour_date && !hiddenBoardCodes.has(board.share_code) && !isDeletedBoardRecord(board);
   }).map((board) => {
     const pourPart = board.pour_part || "미입력";
-    const entries = board.photo_entries || [];
+    // 서버 원본 행을 그대로 두면 렌더할 때마다 memo를 다시 JSON.parse 하게 됩니다.
+    // 목록을 받는 시점에 한 번만 정규화해 둡니다.
+    const entries = cloudRowsToEntries(board.photo_entries || []);
     const settings = getBoardSettingsForRecord(board, board.share_code);
     return {
       boardId: board.id,
@@ -1697,12 +1733,7 @@ async function saveMetaOnce(options = {}) {
       applySavedMetaResponse(saveContext, syncedAtStart, savedMeta, dirtyFields);
       lastSyncedMeta = savedMeta;
     }
-    try {
-      await loadBoardList();
-    } catch (refreshError) {
-      console.warn("Saved board list refresh failed", refreshError);
-      pendingRealtimeRefresh = true;
-    }
+    await syncCurrentBoardIntoList({ resort: dirtyFields.pourDate });
     renderBoardList();
     renderStorageMeter();
   } else {
@@ -1715,11 +1746,7 @@ async function saveMetaOnce(options = {}) {
         pourDate: saveContext.pourDate,
       };
     }
-    try {
-      await loadBoardList();
-    } catch (refreshError) {
-      console.warn("Saved local board list refresh failed", refreshError);
-    }
+    await syncCurrentBoardIntoList({ resort: dirtyFields.pourDate });
     renderBoardList();
     renderStorageMeter();
   }
@@ -1844,12 +1871,7 @@ async function saveEntry(day, photoType = activePhotoType, patch = null) {
   const saved = await persistEntry(day, photoType, patch);
   if (!saved) return false;
 
-  try {
-    await loadBoardList();
-  } catch (error) {
-    console.warn("Saved entry list refresh failed", error);
-    pendingRealtimeRefresh = Boolean(dbClient);
-  }
+  await syncCurrentBoardIntoList();
   renderAll();
   return true;
 }
@@ -2149,12 +2171,7 @@ async function handlePhotoSelection(photoType, startDay, files) {
       }
     }
 
-    try {
-      await loadBoardList();
-    } catch (error) {
-      console.warn("Saved entries list refresh failed", error);
-      pendingRealtimeRefresh = Boolean(dbClient);
-    }
+    await syncCurrentBoardIntoList();
     renderAll();
 
     const overflowCount = Math.max(0, imageFiles.length - targetDays.length - failed);
@@ -2618,15 +2635,32 @@ function getDateKeyForPourDay(pourDate, day) {
   return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
 }
 
+// Intl.DateTimeFormat 생성은 매우 비쌉니다(로케일 데이터 초기화).
+// 이 함수는 목록을 그릴 때 대지·일차마다 호출되므로 포매터와 결과를 모두 캐시합니다.
+let seoulDateFormatter = null;
+let seoulTodayCache = { at: 0, value: "" };
+const SEOUL_TODAY_CACHE_MS = 60 * 1000;
+
 function getSeoulTodayDateKey() {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Seoul",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
+  const now = Date.now();
+  if (seoulTodayCache.value && now - seoulTodayCache.at < SEOUL_TODAY_CACHE_MS) {
+    return seoulTodayCache.value;
+  }
+
+  if (!seoulDateFormatter) {
+    seoulDateFormatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Seoul",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+  }
+
+  const parts = seoulDateFormatter.formatToParts(new Date(now));
   const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
-  return `${values.year}-${values.month}-${values.day}`;
+  const value = `${values.year}-${values.month}-${values.day}`;
+  seoulTodayCache = { at: now, value };
+  return value;
 }
 
 function getWeatherRecord(date) {
@@ -3061,8 +3095,25 @@ async function persistBoardSettingsChange(context) {
   return false;
 }
 
+// 읽기 전용 경로 전용 캐시입니다. normalizeBoardSettings는 호출마다 배열·객체를
+// 새로 만들어 목록 렌더 1회에 수백 번씩 할당이 발생하던 자리입니다.
+// 설정 객체는 변경 시 항상 새 객체로 교체되므로 WeakMap 키로 안전합니다.
+// 주의: 반환값을 변형하지 마세요. 변형이 필요하면 호출부에서 복사하세요.
+const normalizedBoardSettingsCache = new WeakMap();
+
+function getNormalizedBoardSettings(settings) {
+  if (!settings || typeof settings !== "object") return normalizeBoardSettings(settings);
+
+  const cached = normalizedBoardSettingsCache.get(settings);
+  if (cached) return cached;
+
+  const normalized = normalizeBoardSettings(settings);
+  normalizedBoardSettingsCache.set(settings, normalized);
+  return normalized;
+}
+
 function getStoredDaySlotList(settings = state.settings) {
-  return normalizeBoardSettings(settings).daySlots;
+  return getNormalizedBoardSettings(settings).daySlots;
 }
 
 function saveDaySlotList(list) {
@@ -3073,7 +3124,7 @@ function saveDaySlotList(list) {
 }
 
 function getStoredTemperatureSlotList(settings = state.settings) {
-  return normalizeBoardSettings(settings).temperatureSlots;
+  return getNormalizedBoardSettings(settings).temperatureSlots;
 }
 
 function saveTemperatureSlotList(list) {
@@ -3084,7 +3135,7 @@ function saveTemperatureSlotList(list) {
 }
 
 function loadExtraDaySlotHiddenMode(settings = state.settings) {
-  return normalizeBoardSettings(settings).extraDaySlotsHidden;
+  return getNormalizedBoardSettings(settings).extraDaySlotsHidden;
 }
 
 function saveExtraDaySlotHiddenMode(enabled) {
@@ -3212,7 +3263,8 @@ function getDaySlotCount(entries = state.entries, settings = state.settings) {
 }
 
 async function addDaySlot() {
-  const list = getStoredDaySlotList();
+  // 아래에서 push로 변형하므로 반드시 복사본을 씁니다. (설정 캐시 오염 방지)
+  const list = [...getStoredDaySlotList()];
   const displayed = getDaySlotList();
   if (displayed.length >= MAX_DAY_SLOT_COUNT) {
     showToast(`일차는 최대 ${MAX_DAY_SLOT_COUNT}개까지 추가할 수 있습니다.`);
@@ -3226,7 +3278,8 @@ async function addDaySlot() {
 }
 
 async function addTemperatureSlot() {
-  const list = getStoredTemperatureSlotList();
+  // 아래에서 push로 변형하므로 반드시 복사본을 씁니다. (설정 캐시 오염 방지)
+  const list = [...getStoredTemperatureSlotList()];
   const displayed = getTemperatureSlotList();
   if (displayed.length >= MAX_TEMPERATURE_SLOT_COUNT) {
     showToast(`측정 칸은 최대 ${MAX_TEMPERATURE_SLOT_COUNT}개까지 추가할 수 있습니다.`);
@@ -3346,7 +3399,8 @@ async function removePhotoSlot(photoType, slot) {
 async function renameDaySlot(day) {
   const dayNo = Number(day);
   if (!Number.isInteger(dayNo) || dayNo < 1) return;
-  const labels = loadDaySlotLabels();
+  // 아래에서 키를 추가/삭제하므로 복사본을 씁니다. (설정 캐시 오염 방지)
+  const labels = { ...loadDaySlotLabels() };
   const current = typeof labels[dayNo] === "string" ? labels[dayNo] : "";
   const input = window.prompt(
     `${dayNo}번째 칸의 이름을 입력하세요. (비우면 "${dayNo}일차"로 표시)`,
@@ -3365,7 +3419,7 @@ async function renameDaySlot(day) {
 }
 
 function loadDaySlotLabels(settings = state.settings) {
-  return normalizeBoardSettings(settings).dayLabels;
+  return getNormalizedBoardSettings(settings).dayLabels;
 }
 
 function saveDaySlotLabels(map) {
@@ -3453,7 +3507,14 @@ function confirmDangerousAction({ title, message, confirmLabel = "삭제", count
   });
 }
 
+// 이미 정규화가 끝난 객체를 기억해 memo JSON 재파싱을 막습니다.
+// (정규화는 memo -> 필드 이관이라 객체당 한 번만 하면 충분합니다.)
+const normalizedEntryShapes = new WeakSet();
+
 function normalizeEntryShape(entry) {
+  if (!entry || typeof entry !== "object") return entry;
+  if (normalizedEntryShapes.has(entry)) return entry;
+
   if (!entry.photos || typeof entry.photos !== "object") {
     entry.photos = {};
   }
@@ -3490,6 +3551,7 @@ function normalizeEntryShape(entry) {
     entry.photos[PHOTO_TYPES.TEMPERATURE] = memo.photos[PHOTO_TYPES.TEMPERATURE];
   }
 
+  normalizedEntryShapes.add(entry);
   return entry;
 }
 
@@ -3637,18 +3699,40 @@ function getPrintMissingPhotoText(day, photoType = activePhotoType) {
   return getEmptyPhotoText(day, photoType);
 }
 
+// 같은 memo 문자열을 반복해서 JSON.parse 하지 않도록 결과를 캐시합니다.
+// (목록 렌더 1회에 항목당 7~8번씩 호출되던 구간입니다.)
+const entryMemoCache = new Map();
+const ENTRY_MEMO_CACHE_LIMIT = 800;
+
 function parseEntryMemo(memo) {
   if (!memo) return { rainHold: false, photos: {} };
   if (typeof memo === "object") {
     return normalizeEntryMemo(memo);
   }
 
+  const key = String(memo);
+  const cached = entryMemoCache.get(key);
+  if (cached) return cloneEntryMemo(cached);
+
+  let result;
   try {
-    const parsed = JSON.parse(memo);
-    return normalizeEntryMemo(parsed);
+    result = normalizeEntryMemo(JSON.parse(key));
   } catch {
-    return { rainHold: false, photos: {} };
+    result = { rainHold: false, photos: {} };
   }
+
+  if (entryMemoCache.size >= ENTRY_MEMO_CACHE_LIMIT) entryMemoCache.clear();
+  entryMemoCache.set(key, result);
+  return cloneEntryMemo(result);
+}
+
+// 캐시된 결과가 호출부에서 변형돼도 서로 오염되지 않도록 복사해서 돌려줍니다.
+function cloneEntryMemo(value) {
+  const photos = {};
+  Object.entries(value?.photos || {}).forEach(([type, photo]) => {
+    photos[type] = { ...photo };
+  });
+  return { rainHold: value?.rainHold === true, photos };
 }
 
 function serializeEntryMemo(entry) {
@@ -4419,7 +4503,7 @@ function renderDayGrid() {
             ${
               hasPhoto
                 ? `<button class="photo-preview-button" type="button" data-preview-day="${day}" data-preview-type="${escapeAttribute(photoType)}" title="${escapeAttribute(slotLabel)} 사진 크게 보기">
-                    <img src="${escapeAttribute(photo.photoUrl)}" alt="${escapeAttribute(slotLabel)} ${escapeAttribute(typeConfig.label)} 사진" loading="${index < 2 ? "eager" : "lazy"}" decoding="async" fetchpriority="${index < 2 ? "high" : "auto"}">
+                    <img src="${escapeAttribute(photo.photoUrl)}" alt="${escapeAttribute(slotLabel)} ${escapeAttribute(typeConfig.label)} 사진" crossorigin="anonymous" loading="${index < 2 ? "eager" : "lazy"}" decoding="async" fetchpriority="${index < 2 ? "high" : "auto"}">
                   </button>`
                 : `<button class="empty-photo ${rainHold ? "rain-hold" : ""}" type="button" data-paste-day="${day}" title="여기를 누른 뒤 Ctrl+V로 붙여넣기" aria-label="${escapeAttribute(`${slotLabel} ${typeConfig.label} 사진 붙여넣기 대상 선택`)}"><span>${escapeHtml(emptyPhotoText)}</span></button>`
             }
@@ -4496,16 +4580,17 @@ function setupPrintPreviewVisibility() {
 }
 
 function renderPrintArea() {
-  const signature = getPrintImageSignature();
   const token = ++printPreviewRenderToken;
 
   window.clearTimeout(printPreviewTimer);
 
+  // 미리보기가 화면 밖이면 서명 계산(전체 entries JSON.stringify)도 하지 않습니다.
   if (!isPrintPreviewNearViewport) {
     elements.printArea.innerHTML = `<div class="print-render-loading">아래로 이동하면 출력 미리보기를 준비합니다.</div>`;
     return;
   }
 
+  const signature = getPrintImageSignature();
   if (printImageCache.signature === signature && Array.isArray(printImageCache.images)) {
     renderPrintPreviewImages(printImageCache.images);
     return;
@@ -4522,7 +4607,7 @@ function renderPrintArea() {
       if (token !== printPreviewRenderToken) return;
       elements.printArea.innerHTML = `<div class="print-render-loading">출력 미리보기를 만들지 못했습니다.</div>`;
     }
-  }, 80);
+  }, PRINT_PREVIEW_DEBOUNCE_MS);
 }
 
 function renderPrintPreviewImages(images) {
@@ -4571,6 +4656,8 @@ function openPhotoViewer(day, photoType = activePhotoType) {
 
   lastPhotoViewerTrigger = document.activeElement;
   elements.photoViewer.setAttribute("aria-label", "사진 크게 보기");
+  // 그리드·인쇄 로더와 같은 CORS 캐시 항목을 쓰도록 맞춥니다. (같은 사진 중복 다운로드 방지)
+  elements.photoViewerImage.crossOrigin = "anonymous";
   elements.photoViewerImage.src = photo.photoUrl;
   elements.photoViewerImage.alt = `${getPhotoSlotLabel(day, normalizedType)} ${typeConfig.label} 사진`;
   elements.photoViewer.hidden = false;
@@ -4620,7 +4707,7 @@ function getPrintImageSignature() {
     pourDate: state.pourDate || "",
     printSlots,
     entries,
-    dayLabels: normalizeBoardSettings(state.settings).dayLabels,
+    dayLabels: getNormalizedBoardSettings(state.settings).dayLabels,
     printDayLabelBlind: loadPrintDayLabelBlindMode(),
   });
 }
@@ -4645,22 +4732,48 @@ function getPrintPageGroups(photoType = activePhotoType) {
   return groups;
 }
 
+// 화면 미리보기용(저해상도, 캐시함)
 async function getPrintPageImages(renderToken = 0) {
   const signature = getPrintImageSignature();
   if (printImageCache.signature === signature && Array.isArray(printImageCache.images)) {
     return { images: printImageCache.images, failedCount: printImageCache.failedCount || 0 };
   }
 
+  const result = await buildPrintPageImages({
+    scale: PRINT_MM_SCALE_PREVIEW,
+    quality: PRINT_PREVIEW_JPEG_QUALITY,
+    shouldAbort: () => Boolean(renderToken) && renderToken !== printPreviewRenderToken,
+  });
+  if (result.aborted) return { images: [], failedCount: 0 };
+
+  printImageCache = { signature, images: result.images, failedCount: result.failedCount };
+  return { images: result.images, failedCount: result.failedCount };
+}
+
+// PDF/인쇄용(고해상도). 사용자가 버튼을 누른 순간에만 만들고 캐시하지 않습니다.
+async function getPrintExportImages() {
+  const result = await buildPrintPageImages({
+    scale: PRINT_MM_SCALE_EXPORT,
+    quality: PRINT_EXPORT_JPEG_QUALITY,
+  });
+  return { images: result.images, failedCount: result.failedCount };
+}
+
+async function buildPrintPageImages({ scale, quality, shouldAbort = null } = {}) {
   const photoType = activePhotoType;
   const groups = getPrintPageGroups(photoType);
   const photos = await loadPrintPhotos(photoType);
-  if (renderToken && renderToken !== printPreviewRenderToken) {
-    return { images: [], failedCount: 0 };
-  }
+  if (shouldAbort && shouldAbort()) return { images: [], failedCount: 0, aborted: true };
+
   const failedCount = countPrintPhotoFailures(photos);
-  const images = groups.map((group) => createPrintPageImage(group, photos, photoType));
-  printImageCache = { signature, images, failedCount };
-  return { images, failedCount };
+  const images = [];
+  for (const group of groups) {
+    // 페이지를 하나씩 순차 처리해 한 번에 여러 캔버스가 메모리에 남지 않게 합니다.
+    images.push(await createPrintPageImage(group, photos, photoType, { scale, quality }));
+    if (shouldAbort && shouldAbort()) return { images: [], failedCount: 0, aborted: true };
+  }
+
+  return { images, failedCount, aborted: false };
 }
 
 async function loadPrintPhotos(photoType = activePhotoType) {
@@ -4694,42 +4807,69 @@ function loadPrintPhoto(src) {
   });
 }
 
-function createPrintPageImage(group, photos, photoType = activePhotoType) {
-  let canvas = drawPrintPage(group, photos, true, photoType);
+// PNG + 동기 toDataURL은 페이지당 수백 ms~수 초 동안 화면을 통째로 멈춥니다.
+// 비동기 toBlob + JPEG으로 바꿔 메인스레드를 놓아주고, 용량도 3~8배 줄입니다.
+async function createPrintPageImage(group, photos, photoType = activePhotoType, options = {}) {
+  const scale = options.scale || PRINT_MM_SCALE_EXPORT;
+  const quality = options.quality || PRINT_EXPORT_JPEG_QUALITY;
+
+  let canvas = drawPrintPage(group, photos, true, photoType, scale);
   try {
-    return canvas.toDataURL("image/png");
+    return await canvasToJpegDataUrl(canvas, quality);
   } catch (error) {
     console.warn("Photo canvas export failed. Retrying without photos.", error);
-    canvas = drawPrintPage(group, photos, false, photoType);
-    return canvas.toDataURL("image/png");
+    canvas = drawPrintPage(group, photos, false, photoType, scale);
+    return await canvasToJpegDataUrl(canvas, quality);
   }
 }
 
+async function canvasToJpegDataUrl(canvas, quality) {
+  let dataUrl = "";
+  try {
+    dataUrl = await blobToDataUrl(await canvasToJpegBlob(canvas, quality));
+  } catch (error) {
+    // 일부 모바일 브라우저에서 toBlob이 null을 주는 경우가 있어 동기 방식으로 한 번 더 시도합니다.
+    console.warn("toBlob JPEG 변환 실패. toDataURL로 대체합니다.", error);
+    dataUrl = canvas.toDataURL("image/jpeg", quality);
+  }
+  // 캔버스 픽셀 버퍼를 즉시 놓아주도록 크기를 줄여 둡니다. (모바일 메모리 압박 완화)
+  canvas.width = 1;
+  canvas.height = 1;
+  return dataUrl;
+}
+
 function printMm(value) {
-  return value * PRINT_MM_SCALE;
+  return value * printMmScale;
 }
 
 function printPt(value) {
-  return value * (96 / 72) * (PRINT_MM_SCALE / (96 / 25.4));
+  return value * (96 / 72) * (printMmScale / (96 / 25.4));
 }
 
-function drawPrintPage(group, photos, allowPhotos, photoType = activePhotoType) {
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(printMm(PRINT_PAGE_WIDTH_MM));
-  canvas.height = Math.round(printMm(PRINT_PAGE_HEIGHT_MM));
+function drawPrintPage(group, photos, allowPhotos, photoType = activePhotoType, scale = PRINT_MM_SCALE_EXPORT) {
+  // 그리는 동안만 배율을 바꿉니다. 아래 그리기 호출은 전부 동기라 중간에 섞이지 않습니다.
+  const previousScale = printMmScale;
+  printMmScale = scale;
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(printMm(PRINT_PAGE_WIDTH_MM));
+    canvas.height = Math.round(printMm(PRINT_PAGE_HEIGHT_MM));
 
-  const ctx = canvas.getContext("2d");
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = "high";
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
 
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  drawPrintTitle(ctx);
-  drawPrintProjectName(ctx);
-  drawPrintTable(ctx, group, photos, allowPhotos, photoType);
+    drawPrintTitle(ctx);
+    drawPrintProjectName(ctx);
+    drawPrintTable(ctx, group, photos, allowPhotos, photoType);
 
-  return canvas;
+    return canvas;
+  } finally {
+    printMmScale = previousScale;
+  }
 }
 
 function drawPrintTitle(ctx) {
@@ -5044,7 +5184,8 @@ async function handlePrint() {
   beginPhotoMutation();
   showToast("출력 파일을 준비하는 중입니다.");
   try {
-    const { images, failedCount } = await getPrintPageImages();
+    // 미리보기 캐시(저해상도)가 아니라 인쇄 해상도로 새로 만듭니다.
+    const { images, failedCount } = await getPrintExportImages();
     if (!images.length) {
       showToast(`${getPhotoTypeConfig(activePhotoType).sectionTitle}이 없습니다.`);
       return;
@@ -5088,7 +5229,8 @@ async function savePrintPdf(images) {
     const pageH = 297;
     images.forEach((src, index) => {
       if (index > 0) pdf.addPage();
-      pdf.addImage(src, "PNG", 0, 0, pageW, pageH, undefined, "FAST");
+      // JPEG로 넣습니다. PNG는 jsPDF가 순수 JS로 재압축해 느리고 용량도 3~8배 큽니다.
+      pdf.addImage(src, "JPEG", 0, 0, pageW, pageH, undefined, "FAST");
     });
 
     const filename = buildPdfFilename();
@@ -5841,12 +5983,32 @@ function addDays(dateValue, offset) {
   return date;
 }
 
+// toLocaleDateString/toLocaleString은 호출할 때마다 내부에서 포매터를 새로 만듭니다.
+// 목록·일차 카드에서 수백 번씩 불리는 자리라 포매터를 재사용합니다. (출력 문자열은 동일)
+const dateTimeFormatterCache = new Map();
+
+function getDateTimeFormatter(locale, options) {
+  const key = `${locale}|${JSON.stringify(options)}`;
+  let formatter = dateTimeFormatterCache.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(locale, options);
+    dateTimeFormatterCache.set(key, formatter);
+  }
+  return formatter;
+}
+
+const KO_WEEKDAY_SHORT_OPTIONS = { weekday: "short" };
+
+function formatKoreanWeekday(date) {
+  return getDateTimeFormatter("ko-KR", KO_WEEKDAY_SHORT_OPTIONS).format(date);
+}
+
 function formatMonthDay(date) {
-  return date.toLocaleDateString("ko-KR", {
+  return getDateTimeFormatter("ko-KR", {
     month: "2-digit",
     day: "2-digit",
     weekday: "short",
-  });
+  }).format(date);
 }
 
 function formatListDate(value) {
@@ -5854,7 +6016,7 @@ function formatListDate(value) {
   const date = new Date(`${value}T00:00:00`);
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
-  const weekday = date.toLocaleDateString("ko-KR", { weekday: "short" });
+  const weekday = formatKoreanWeekday(date);
   return `${month}.${day}.(${weekday})`;
 }
 
@@ -5879,7 +6041,7 @@ function formatBoardResultDay(value) {
   const year = date.getFullYear();
   const month = date.getMonth() + 1;
   const dateNumber = date.getDate();
-  const weekday = date.toLocaleDateString("ko-KR", { weekday: "short" });
+  const weekday = formatKoreanWeekday(date);
   return `${year}년 ${month}월 ${dateNumber}일(${weekday})`;
 }
 
@@ -5889,12 +6051,12 @@ function formatBoardResultDayShort(value) {
   const date = new Date(`${day}T00:00:00`);
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const dateNumber = String(date.getDate()).padStart(2, "0");
-  const weekday = date.toLocaleDateString("ko-KR", { weekday: "short" });
+  const weekday = formatKoreanWeekday(date);
   return `${month}.${dateNumber}.(${weekday})`;
 }
 
 function formatDateTime(value) {
-  return new Date(value).toLocaleString("ko-KR", {
+  return getDateTimeFormatter("ko-KR", {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -5902,7 +6064,7 @@ function formatDateTime(value) {
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
-  });
+  }).format(new Date(value));
 }
 
 function toDateInputValue(date) {
