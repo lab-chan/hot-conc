@@ -72,12 +72,15 @@ const IMAGE_QUALITY = 0.7;
 const PHOTO_CACHE_CONTROL_SECONDS = "31536000";
 const REALTIME_REFRESH_DEBOUNCE_MS = 250;
 const PRINT_PAGE_GROUP_SIZE = 2; // 사진대지 1페이지당 일차 수(2일차 = 사진 2장). 일차 수에 맞춰 페이지가 자동 증감합니다.
-// 인쇄본은 6배(1260x1782px)로 그리고, 화면 미리보기는 3배로만 그립니다.
-// 미리보기까지 6배로 그리면 페이지당 224만 화소를 매번 다시 인코딩하게 되어 입력이 멈춥니다.
+// 인쇄본(PDF)은 항상 6배 = 1260x1782px. 기존과 동일한 해상도입니다.
 const PRINT_MM_SCALE_EXPORT = 6;
-const PRINT_MM_SCALE_PREVIEW = 3;
-const PRINT_EXPORT_JPEG_QUALITY = 0.92;
-const PRINT_PREVIEW_JPEG_QUALITY = 0.8;
+const PRINT_EXPORT_JPEG_QUALITY = 0.95;
+// 화면 미리보기는 표시되는 크기에 맞춰서만 그립니다.
+// 미리보기는 CSS에서 210mm(=794 CSS px) 폭으로 표시되므로, 화소 밀도 1배 화면이면
+// 3.78배면 1:1입니다. 그보다 크게 그려봐야 화면에서 어차피 줄어들어 버려집니다.
+const PRINT_PREVIEW_MIN_SCALE = 4;
+const PRINT_PREVIEW_SCALE_PER_DPR = 3.8;
+const PRINT_PREVIEW_JPEG_QUALITY = 0.86;
 // 타설부위를 타이핑하는 동안 미리보기를 계속 다시 그리지 않도록 여유를 둡니다.
 const PRINT_PREVIEW_DEBOUNCE_MS = 400;
 let printMmScale = PRINT_MM_SCALE_EXPORT;
@@ -4709,6 +4712,8 @@ function getPrintImageSignature() {
     entries,
     dayLabels: getNormalizedBoardSettings(state.settings).dayLabels,
     printDayLabelBlind: loadPrintDayLabelBlindMode(),
+    // 브라우저 확대/모니터 이동으로 화소 밀도가 바뀌면 미리보기를 다시 그립니다.
+    previewScale: getPrintPreviewScale(),
   });
 }
 
@@ -4732,7 +4737,14 @@ function getPrintPageGroups(photoType = activePhotoType) {
   return groups;
 }
 
-// 화면 미리보기용(저해상도, 캐시함)
+// 미리보기 배율 = 화면에 실제로 표시되는 화소수에 맞춤(고해상도 화면은 인쇄본과 동일한 6배).
+// 이보다 크게 그리면 화면에서 축소돼 버려지는 화소를 인코딩하느라 시간만 씁니다.
+function getPrintPreviewScale() {
+  const dpr = window.devicePixelRatio || 1;
+  return clamp(Math.ceil(PRINT_PREVIEW_SCALE_PER_DPR * dpr), PRINT_PREVIEW_MIN_SCALE, PRINT_MM_SCALE_EXPORT);
+}
+
+// 화면 미리보기용(캐시함)
 async function getPrintPageImages(renderToken = 0) {
   const signature = getPrintImageSignature();
   if (printImageCache.signature === signature && Array.isArray(printImageCache.images)) {
@@ -4740,7 +4752,7 @@ async function getPrintPageImages(renderToken = 0) {
   }
 
   const result = await buildPrintPageImages({
-    scale: PRINT_MM_SCALE_PREVIEW,
+    scale: getPrintPreviewScale(),
     quality: PRINT_PREVIEW_JPEG_QUALITY,
     shouldAbort: () => Boolean(renderToken) && renderToken !== printPreviewRenderToken,
   });
