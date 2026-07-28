@@ -69,6 +69,8 @@ const ESTIMATED_PHOTO_BYTES = 450 * 1024;
 const IMAGE_MAX_WIDTH = 1280;
 const IMAGE_MAX_HEIGHT = 853;
 const IMAGE_QUALITY = 0.7;
+const PHOTO_CACHE_CONTROL_SECONDS = "31536000";
+const REALTIME_REFRESH_DEBOUNCE_MS = 250;
 const PRINT_PAGE_GROUP_SIZE = 2; // 사진대지 1페이지당 일차 수(2일차 = 사진 2장). 일차 수에 맞춰 페이지가 자동 증감합니다.
 const PRINT_MM_SCALE = 6;
 const PRINT_PAGE_WIDTH_MM = 210;
@@ -212,11 +214,18 @@ let isBoardSearchComposing = false;
 let isFilePickerOpen = false;
 let filePickerClearTimer = null;
 let pendingRealtimeRefresh = false;
+let pendingRealtimeCurrentBoardRefresh = false;
+let pendingRealtimeListRefresh = false;
+let realtimeRefreshTimer = null;
+let isRealtimeRefreshInProgress = false;
 let activePhotoMutationCount = 0;
 let boardLoadToken = 0;
 let entryLoadSequence = 0;
 let printPreviewRenderToken = 0;
 let printPreviewTimer = null;
+let isPrintPreviewNearViewport = false;
+let hasPrintPreviewScrollActivity = false;
+let printPreviewVisibilityFrame = 0;
 let activePhotoType = DEFAULT_PHOTO_TYPE;
 let pasteTargetDay = null;
 let lastPhotoViewerTrigger = null;
@@ -247,6 +256,7 @@ document.addEventListener("DOMContentLoaded", init);
 async function init() {
   state.shareCode = ensureShareCode();
   bindEvents();
+  setupPrintPreviewVisibility();
   cleanupLegacyPreferences();
   applyAdminModeUi();
   setSyncStatus("저장소를 확인하는 중입니다.");
@@ -1143,10 +1153,26 @@ async function loadCloudEntries() {
 }
 
 function applyCloudEntries(entries) {
-  state.entries = {};
-  (entries || []).forEach((row) => {
-    state.entries[row.day_no] = cloudRowToEntry(row);
+  state.entries = cloudRowsToEntries(entries);
+  updateCurrentBoardSummaryFromState();
+}
+
+function cloudRowsToEntries(entries) {
+  const normalizedEntries = {};
+  getEntryItems(entries).forEach(({ entry, dayNo }) => {
+    if (!dayNo) return;
+    const isCloudRow = Object.prototype.hasOwnProperty.call(entry || {}, "day_no")
+      || Object.prototype.hasOwnProperty.call(entry || {}, "photo_url")
+      || Object.prototype.hasOwnProperty.call(entry || {}, "photo_path");
+    normalizedEntries[dayNo] = isCloudRow
+      ? cloudRowToEntry(entry)
+      : normalizeEntryShape({
+          ...(entry || {}),
+          dayNo,
+          photos: { ...(entry?.photos || {}) },
+        });
   });
+  return normalizedEntries;
 }
 
 function cloudRowToEntry(row) {
@@ -1238,6 +1264,24 @@ async function loadCloudBoardList() {
       photoCount: countPhotoEntries(entries),
     };
   });
+}
+
+function updateCurrentBoardSummaryFromState() {
+  if (!state.shareCode) return;
+  const current = boardList.find((board) => board.shareCode === state.shareCode);
+  if (!current) return;
+
+  current.boardId = state.boardId || current.boardId;
+  current.projectName = normalizeProjectName(state.projectName || DEFAULT_PROJECT_NAME);
+  current.pourPart = state.pourPart || "미입력";
+  current.searchText = normalizeSearchText(current.pourPart);
+  current.pourDate = state.pourDate || current.pourDate;
+  current.createdAt = state.createdAt || current.createdAt;
+  current.entries = state.entries;
+  current.settings = normalizeBoardSettings(state.settings);
+  current.completedCount = countCompletedEntries(state.entries, PHOTO_TYPES.CURING, null, { pourDate: state.pourDate });
+  current.temperatureCount = countCompletedEntries(state.entries, PHOTO_TYPES.TEMPERATURE);
+  current.photoCount = countPhotoEntries(state.entries);
 }
 
 async function fetchCloudBoardListRows(includeExtendedColumns) {
@@ -1355,13 +1399,10 @@ async function shiftPourDate(offset) {
 }
 
 async function subscribeToChanges() {
-  if (!dbClient || !state.boardId) return;
-  if (realtimeChannel) {
-    await dbClient.removeChannel(realtimeChannel);
-  }
+  if (!dbClient || realtimeChannel) return;
 
   realtimeChannel = dbClient
-    .channel(`curing-board-${state.shareCode}`)
+    .channel("curing-photo-boards")
     .on(
       "postgres_changes",
       {
@@ -1369,24 +1410,12 @@ async function subscribeToChanges() {
         schema: "public",
         table: "photo_boards",
       },
-      async (payload) => {
-        if (shouldDeferRealtimeRefresh()) {
-          pendingRealtimeRefresh = true;
-          return;
+      (payload) => {
+        const affectsCurrent = payload.new?.share_code === state.shareCode || payload.old?.share_code === state.shareCode;
+        applyRealtimeBoardListChange(payload);
+        if (affectsCurrent) {
+          scheduleRealtimeRefresh({ refreshCurrentBoard: true, refreshList: false });
         }
-
-        if (payload.new?.share_code === state.shareCode || payload.old?.share_code === state.shareCode) {
-          const inputFocused = isMetaInputFocused();
-          await loadCloudBoard({ syncInputs: !inputFocused });
-          if (inputFocused) {
-            renderMetaPreview();
-          } else {
-            renderAll();
-          }
-        }
-        await loadBoardList();
-        renderBoardList();
-        renderStorageMeter();
       }
     )
     .on(
@@ -1396,19 +1425,13 @@ async function subscribeToChanges() {
         schema: "public",
         table: "photo_entries",
       },
-      async (payload) => {
-        if (shouldDeferRealtimeRefresh()) {
-          pendingRealtimeRefresh = true;
-          return;
+      (payload) => {
+        const affectsCurrent = payload.new?.board_id === state.boardId || payload.old?.board_id === state.boardId;
+        if (affectsCurrent) {
+          scheduleRealtimeRefresh({ refreshCurrentBoard: true, refreshList: false });
+        } else {
+          applyRealtimePhotoEntryListChange(payload);
         }
-
-        if (payload.new?.board_id === state.boardId || payload.old?.board_id === state.boardId) {
-          await loadCloudEntries();
-          renderAll();
-        }
-        await loadBoardList();
-        renderBoardList();
-        renderStorageMeter();
       }
     )
     .subscribe((status) => {
@@ -1418,6 +1441,118 @@ async function subscribeToChanges() {
         setSyncStatus("실시간 수신이 불안정합니다. 저장은 계속 시도합니다.");
       }
     });
+}
+
+function applyRealtimeBoardListChange(payload) {
+  const row = payload?.new && Object.keys(payload.new).length ? payload.new : payload?.old;
+  if (!row) return;
+
+  const existingIndex = boardList.findIndex((board) => board.boardId === row.id || board.shareCode === row.share_code);
+  const existing = existingIndex >= 0 ? boardList[existingIndex] : null;
+  const isRemoved = payload.eventType === "DELETE" || isDeletedBoardRecord(row) || !row.share_code || !row.pour_date;
+  if (isRemoved) {
+    if (existingIndex >= 0) {
+      boardList.splice(existingIndex, 1);
+      renderBoardList();
+      renderStorageMeter();
+    }
+    return;
+  }
+
+  if (!existing) {
+    const pourPart = row.pour_part || "미입력";
+    boardList.push({
+      boardId: row.id,
+      shareCode: row.share_code,
+      projectName: normalizeProjectName(row.project_name || DEFAULT_PROJECT_NAME),
+      pourPart,
+      searchText: normalizeSearchText(pourPart),
+      pourDate: row.pour_date || "",
+      createdAt: row.created_at || "",
+      updatedAt: row.updated_at || "",
+      entries: {},
+      settings: getBoardSettingsForRecord(row, row.share_code),
+      completedCount: 0,
+      temperatureCount: 0,
+      photoCount: 0,
+    });
+    sortBoardListInPlace();
+    renderBoardList();
+    return;
+  }
+
+  const previousVisibleSignature = JSON.stringify([
+    existing.shareCode,
+    existing.projectName,
+    existing.pourPart,
+    existing.pourDate,
+    existing.settings,
+  ]);
+  existing.shareCode = row.share_code || existing.shareCode;
+  existing.projectName = normalizeProjectName(row.project_name || existing.projectName || DEFAULT_PROJECT_NAME);
+  existing.pourPart = row.pour_part || existing.pourPart || "미입력";
+  existing.searchText = normalizeSearchText(existing.pourPart);
+  existing.pourDate = row.pour_date || existing.pourDate;
+  existing.createdAt = row.created_at || existing.createdAt;
+  existing.updatedAt = row.updated_at || existing.updatedAt;
+  if (Object.prototype.hasOwnProperty.call(row, "settings")) {
+    existing.settings = getBoardSettingsForRecord(row, existing.shareCode);
+  }
+  const nextVisibleSignature = JSON.stringify([
+    existing.shareCode,
+    existing.projectName,
+    existing.pourPart,
+    existing.pourDate,
+    existing.settings,
+  ]);
+  if (previousVisibleSignature !== nextVisibleSignature) {
+    sortBoardListInPlace();
+    renderBoardList();
+  }
+}
+
+function applyRealtimePhotoEntryListChange(payload) {
+  const row = payload?.new && Object.keys(payload.new).length ? payload.new : payload?.old;
+  const boardId = row?.board_id;
+  const dayNo = Number(row?.day_no || 0);
+  if (!boardId || !dayNo) {
+    scheduleRealtimeRefresh({ refreshCurrentBoard: false, refreshList: true });
+    return;
+  }
+
+  const board = boardList.find((item) => item.boardId === boardId);
+  if (!board) {
+    scheduleRealtimeRefresh({ refreshCurrentBoard: false, refreshList: true });
+    return;
+  }
+
+  const entries = cloudRowsToEntries(board.entries || {});
+  if (payload.eventType === "DELETE") {
+    delete entries[dayNo];
+  } else {
+    entries[dayNo] = cloudRowToEntry(payload.new);
+  }
+  board.entries = entries;
+  refreshBoardListSummaryCounts(board);
+  renderBoardListItem(board);
+  renderBoardResultControls(getVisibleBoardList());
+  renderStorageMeter();
+}
+
+function refreshBoardListSummaryCounts(board) {
+  board.completedCount = countCompletedEntries(board.entries || {}, PHOTO_TYPES.CURING, null, {
+    pourDate: board.pourDate || "",
+  });
+  board.temperatureCount = countCompletedEntries(board.entries || {}, PHOTO_TYPES.TEMPERATURE);
+  board.photoCount = countPhotoEntries(board.entries || {});
+}
+
+function sortBoardListInPlace() {
+  boardList.sort((a, b) => {
+    const dateCompare = (b.pourDate || "").localeCompare(a.pourDate || "");
+    if (dateCompare) return dateCompare;
+    return (b.createdAt || "").localeCompare(a.createdAt || "");
+  });
 }
 
 function syncInputsFromState() {
@@ -2078,6 +2213,7 @@ async function preparePhotoEntry(photoType, day, file) {
         .from(config.bucket)
         .upload(path, image.blob, {
           contentType: "image/jpeg",
+          cacheControl: PHOTO_CACHE_CONTROL_SECONDS,
           upsert: false,
         }));
     } catch (requestError) {
@@ -3673,16 +3809,32 @@ function shouldDeferRealtimeRefresh() {
 }
 
 async function flushPendingRealtimeRefresh() {
-  if (!pendingRealtimeRefresh || shouldDeferRealtimeRefresh() || !dbClient) return;
+  if (!pendingRealtimeRefresh || shouldDeferRealtimeRefresh() || !dbClient || isRealtimeRefreshInProgress) return;
+
+  window.clearTimeout(realtimeRefreshTimer);
+  realtimeRefreshTimer = null;
+  const hasScopedRequest = pendingRealtimeCurrentBoardRefresh || pendingRealtimeListRefresh;
+  const refreshCurrentBoard = pendingRealtimeCurrentBoardRefresh || !hasScopedRequest;
+  const refreshList = pendingRealtimeListRefresh || !hasScopedRequest;
   pendingRealtimeRefresh = false;
+  pendingRealtimeCurrentBoardRefresh = false;
+  pendingRealtimeListRefresh = false;
+  isRealtimeRefreshInProgress = true;
 
   try {
     const inputFocused = isMetaInputFocused();
-    await loadCloudBoard({ syncInputs: !inputFocused });
-    await loadCloudEntries();
-    await loadBoardList();
+    if (refreshCurrentBoard && state.shareCode) {
+      await loadCloudBoard({ syncInputs: !inputFocused });
+    }
+    if (refreshList) {
+      await loadBoardList();
+    }
     if (inputFocused) {
       renderMetaPreview();
+    } else if (!refreshList) {
+      renderMetaPreview();
+      const currentBoard = boardList.find((board) => board.shareCode === state.shareCode);
+      if (currentBoard) renderBoardListItem(currentBoard);
     } else {
       renderAll();
     }
@@ -3690,7 +3842,30 @@ async function flushPendingRealtimeRefresh() {
   } catch (error) {
     console.error(error);
     pendingRealtimeRefresh = true;
+    pendingRealtimeCurrentBoardRefresh ||= refreshCurrentBoard;
+    pendingRealtimeListRefresh ||= refreshList;
+  } finally {
+    isRealtimeRefreshInProgress = false;
+    if (pendingRealtimeRefresh && !shouldDeferRealtimeRefresh()) {
+      scheduleRealtimeRefresh({
+        refreshCurrentBoard: pendingRealtimeCurrentBoardRefresh,
+        refreshList: pendingRealtimeListRefresh,
+      });
+    }
   }
+}
+
+function scheduleRealtimeRefresh({ refreshCurrentBoard = false, refreshList = true } = {}) {
+  pendingRealtimeRefresh = true;
+  pendingRealtimeCurrentBoardRefresh ||= refreshCurrentBoard;
+  pendingRealtimeListRefresh ||= refreshList;
+  if (shouldDeferRealtimeRefresh() || isRealtimeRefreshInProgress) return;
+
+  window.clearTimeout(realtimeRefreshTimer);
+  realtimeRefreshTimer = window.setTimeout(() => {
+    realtimeRefreshTimer = null;
+    flushPendingRealtimeRefresh().catch(console.error);
+  }, REALTIME_REFRESH_DEBOUNCE_MS);
 }
 
 function getBoardCuringProgress(board) {
@@ -3732,41 +3907,61 @@ function renderBoardList() {
   }
 
   elements.boardList.innerHTML = visibleBoards
-    .map((board) => {
-      const active = board.shareCode === state.shareCode;
-      const progress = getBoardCuringProgress(board);
-      const boardTemperatureSlots = getTemperatureSlotList(board.entries || {}, board.settings);
-      const visibleTemperatureSet = new Set(boardTemperatureSlots);
-      const temperatureCount = countCompletedEntries(board.entries || {}, PHOTO_TYPES.TEMPERATURE, visibleTemperatureSet);
-      const rainAudit = getRainAuditStats([board]);
-      return `
-        <div class="board-list-item ${active ? "active" : ""} ${progress.complete ? "" : "incomplete"}">
-          <button class="board-open-button" type="button" data-board-code="${escapeAttribute(board.shareCode)}" aria-current="${active ? "true" : "false"}" aria-label="${escapeAttribute(`${formatListDate(board.pourDate)} ${board.pourPart} 사진대지 열기`)}">
-            <span class="board-date">${escapeHtml(formatListDate(board.pourDate))}</span>
-            <span class="board-part">${escapeHtml(board.pourPart)}</span>
-            <span class="board-counts">
-              <span class="board-count ${progress.complete ? "complete" : ""}">${progress.completed}/${progress.total} 양생</span>
-              ${
-                temperatureCount > 0
-                  ? `<span class="board-count temperature">${temperatureCount}장 측정</span>`
-                  : ""
-              }
-              ${
-                isAdminMode && rainAudit.mismatch > 0
-                  ? `<span class="board-count weather-mismatch">우천 ${rainAudit.mismatch}건 확인</span>`
-                  : ""
-              }
-            </span>
-          </button>
+    .map(renderBoardListItemHtml)
+    .join("");
+}
+
+function renderBoardListItemHtml(board) {
+  const active = board.shareCode === state.shareCode;
+  const progress = getBoardCuringProgress(board);
+  const boardTemperatureSlots = getTemperatureSlotList(board.entries || {}, board.settings);
+  const visibleTemperatureSet = new Set(boardTemperatureSlots);
+  const temperatureCount = countCompletedEntries(board.entries || {}, PHOTO_TYPES.TEMPERATURE, visibleTemperatureSet);
+  const rainAudit = getRainAuditStats([board]);
+  return `
+    <div class="board-list-item ${active ? "active" : ""} ${progress.complete ? "" : "incomplete"}">
+      <button class="board-open-button" type="button" data-board-code="${escapeAttribute(board.shareCode)}" aria-current="${active ? "true" : "false"}" aria-label="${escapeAttribute(`${formatListDate(board.pourDate)} ${board.pourPart} 사진대지 열기`)}">
+        <span class="board-date">${escapeHtml(formatListDate(board.pourDate))}</span>
+        <span class="board-part">${escapeHtml(board.pourPart)}</span>
+        <span class="board-counts">
+          <span class="board-count ${progress.complete ? "complete" : ""}">${progress.completed}/${progress.total} 양생</span>
           ${
-            isAdminMode
-              ? `<button class="board-list-delete-button admin-only" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제" aria-label="${escapeAttribute(board.pourPart)} 사진대지 삭제">×</button>`
+            temperatureCount > 0
+              ? `<span class="board-count temperature">${temperatureCount}장 측정</span>`
               : ""
           }
-        </div>
-      `;
-    })
-    .join("");
+          ${
+            isAdminMode && rainAudit.mismatch > 0
+              ? `<span class="board-count weather-mismatch">우천 ${rainAudit.mismatch}건 확인</span>`
+              : ""
+          }
+        </span>
+      </button>
+      ${
+        isAdminMode
+          ? `<button class="board-list-delete-button admin-only" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제" aria-label="${escapeAttribute(board.pourPart)} 사진대지 삭제">×</button>`
+          : ""
+      }
+    </div>
+  `;
+}
+
+function renderBoardListItem(board) {
+  if (!board?.shareCode) return;
+  const visible = getVisibleBoardList().some((item) => item.shareCode === board.shareCode);
+  const button = Array.from(elements.boardList.querySelectorAll("[data-board-code]")).find(
+    (item) => item.dataset.boardCode === board.shareCode,
+  );
+  const container = button?.closest(".board-list-item");
+  if (!visible) {
+    container?.remove();
+    return;
+  }
+  if (!container) {
+    renderBoardList();
+    return;
+  }
+  container.outerHTML = renderBoardListItemHtml(board);
 }
 
 function toggleBoardListExpanded() {
@@ -4185,7 +4380,7 @@ function renderDayGrid() {
   const canRenameSlots = isAdminMode && photoType === PHOTO_TYPES.CURING;
   const maxSlotCount = photoType === PHOTO_TYPES.TEMPERATURE ? MAX_TEMPERATURE_SLOT_COUNT : MAX_DAY_SLOT_COUNT;
   let gridHtml = days(photoType)
-    .map((day) => {
+    .map((day, index) => {
       const entry = getEntry(day);
       const photo = getTypedPhoto(entry, photoType);
       const hasPhoto = Boolean(photo.photoUrl);
@@ -4224,7 +4419,7 @@ function renderDayGrid() {
             ${
               hasPhoto
                 ? `<button class="photo-preview-button" type="button" data-preview-day="${day}" data-preview-type="${escapeAttribute(photoType)}" title="${escapeAttribute(slotLabel)} 사진 크게 보기">
-                    <img src="${escapeAttribute(photo.photoUrl)}" alt="${escapeAttribute(slotLabel)} ${escapeAttribute(typeConfig.label)} 사진" loading="lazy" decoding="async">
+                    <img src="${escapeAttribute(photo.photoUrl)}" alt="${escapeAttribute(slotLabel)} ${escapeAttribute(typeConfig.label)} 사진" loading="${index < 2 ? "eager" : "lazy"}" decoding="async" fetchpriority="${index < 2 ? "high" : "auto"}">
                   </button>`
                 : `<button class="empty-photo ${rainHold ? "rain-hold" : ""}" type="button" data-paste-day="${day}" title="여기를 누른 뒤 Ctrl+V로 붙여넣기" aria-label="${escapeAttribute(`${slotLabel} ${typeConfig.label} 사진 붙여넣기 대상 선택`)}"><span>${escapeHtml(emptyPhotoText)}</span></button>`
             }
@@ -4276,11 +4471,40 @@ function renderDayGrid() {
   }
 }
 
+function setupPrintPreviewVisibility() {
+  if (!elements.printArea) return;
+  const previewSection = elements.printArea.closest(".preview-section") || elements.printArea;
+  const updateVisibility = () => {
+    printPreviewVisibilityFrame = 0;
+    const rect = previewSection.getBoundingClientRect();
+    const wasNearViewport = isPrintPreviewNearViewport;
+    isPrintPreviewNearViewport = hasPrintPreviewScrollActivity
+      && rect.top < window.innerHeight * 0.85
+      && rect.bottom > 0;
+    if (isPrintPreviewNearViewport && !wasNearViewport) renderPrintArea();
+  };
+  const scheduleVisibilityUpdate = () => {
+    if (printPreviewVisibilityFrame) return;
+    printPreviewVisibilityFrame = window.requestAnimationFrame(updateVisibility);
+  };
+  const handleScroll = () => {
+    hasPrintPreviewScrollActivity = true;
+    scheduleVisibilityUpdate();
+  };
+  window.addEventListener("scroll", handleScroll, { passive: true });
+  window.addEventListener("resize", scheduleVisibilityUpdate, { passive: true });
+}
+
 function renderPrintArea() {
   const signature = getPrintImageSignature();
   const token = ++printPreviewRenderToken;
 
   window.clearTimeout(printPreviewTimer);
+
+  if (!isPrintPreviewNearViewport) {
+    elements.printArea.innerHTML = `<div class="print-render-loading">아래로 이동하면 출력 미리보기를 준비합니다.</div>`;
+    return;
+  }
 
   if (printImageCache.signature === signature && Array.isArray(printImageCache.images)) {
     renderPrintPreviewImages(printImageCache.images);
@@ -4290,7 +4514,7 @@ function renderPrintArea() {
   elements.printArea.innerHTML = `<div class="print-render-loading">출력 미리보기 준비 중</div>`;
   printPreviewTimer = window.setTimeout(async () => {
     try {
-      const { images } = await getPrintPageImages();
+      const { images } = await getPrintPageImages(token);
       if (token !== printPreviewRenderToken) return;
       renderPrintPreviewImages(images);
     } catch (error) {
@@ -4421,7 +4645,7 @@ function getPrintPageGroups(photoType = activePhotoType) {
   return groups;
 }
 
-async function getPrintPageImages() {
+async function getPrintPageImages(renderToken = 0) {
   const signature = getPrintImageSignature();
   if (printImageCache.signature === signature && Array.isArray(printImageCache.images)) {
     return { images: printImageCache.images, failedCount: printImageCache.failedCount || 0 };
@@ -4430,6 +4654,9 @@ async function getPrintPageImages() {
   const photoType = activePhotoType;
   const groups = getPrintPageGroups(photoType);
   const photos = await loadPrintPhotos(photoType);
+  if (renderToken && renderToken !== printPreviewRenderToken) {
+    return { images: [], failedCount: 0 };
+  }
   const failedCount = countPrintPhotoFailures(photos);
   const images = groups.map((group) => createPrintPageImage(group, photos, photoType));
   printImageCache = { signature, images, failedCount };
@@ -5113,11 +5340,6 @@ async function deleteBoardByShareCode(shareCode) {
 
   try {
     if (target.boardId && dbClient) {
-      if (deletingCurrent && realtimeChannel) {
-        await dbClient.removeChannel(realtimeChannel);
-        realtimeChannel = null;
-      }
-
       deleteResult = await deleteCloudBoardTarget(target);
     } else {
       localStorage.removeItem(LOCAL_PREFIX + deletedShareCode);
@@ -5442,34 +5664,40 @@ async function openBoard(shareCode) {
   if (token !== boardLoadToken) return;
 
   const selectedBoard = boardList.find((board) => board.shareCode === shareCode);
+  const cachedEntries = dbClient && selectedBoard
+    ? cloudRowsToEntries(selectedBoard.entries || [])
+    : {};
   clearBoardUrlParam();
   state = {
     shareCode,
-    boardId: null,
+    boardId: selectedBoard?.boardId || null,
     projectName: selectedBoard?.projectName || DEFAULT_PROJECT_NAME,
     pourPart: selectedBoard?.pourPart || "",
     pourDate: selectedBoard?.pourDate || toDateInputValue(new Date()),
     createdAt: selectedBoard?.createdAt || "",
-    entries: {},
+    entries: cachedEntries,
     settings: normalizeBoardSettings(selectedBoard?.settings, {
       fallback: loadBoardSettingsFallback(shareCode) || getLegacyBoardSettings(),
     }),
   };
+  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
   syncInputsFromState();
   closePhotoViewer();
   renderAll();
 
   if (dbClient) {
     const loaded = await loadCloudBoard();
-    if (loaded === null || token !== boardLoadToken || state.shareCode !== shareCode) return;
+    if (loaded === null || token !== boardLoadToken || state.shareCode !== shareCode) {
+      if (token === boardLoadToken) renderAll();
+      return;
+    }
     await subscribeToChanges();
   } else {
     loadLocalBoard();
   }
 
   if (token !== boardLoadToken || state.shareCode !== shareCode) return;
-  await loadBoardList();
-  if (token !== boardLoadToken || state.shareCode !== shareCode) return;
+  updateCurrentBoardSummaryFromState();
   renderAll();
 }
 
