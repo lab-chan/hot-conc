@@ -572,9 +572,11 @@ textarea:focus-visible,
 }
 
 .standard-panel-header strong {
+  min-width: 0;
   color: var(--accent-dark);
   font-size: 15px;
   font-weight: 900;
+  white-space: nowrap;
 }
 
 .standard-panel-header span {
@@ -582,6 +584,27 @@ textarea:focus-visible,
   font-size: 12px;
   font-weight: 800;
   white-space: nowrap;
+}
+
+.shortcut-guide-button {
+  width: 30px;
+  min-height: 30px;
+  flex: 0 0 auto;
+  border-color: rgba(31, 122, 90, 0.3);
+  background: #fff;
+  color: var(--accent-dark);
+  padding: 0;
+}
+
+.shortcut-guide-button:hover {
+  border-color: rgba(31, 122, 90, 0.52);
+  background: var(--accent-soft);
+}
+
+.shortcut-guide-button .button-icon {
+  width: 13px;
+  height: 13px;
+  font-size: 14px;
 }
 
 .standard-summary-grid {
@@ -2156,13 +2179,19 @@ body.viewer-open {
   }
 
   .standard-panel-header {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 2px;
+    align-items: center;
+    flex-direction: row;
+    gap: 6px;
   }
 
-  .standard-panel-header span {
-    white-space: normal;
+  .standard-panel-header strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .shortcut-guide-button {
+    width: 28px;
+    min-height: 28px;
   }
 
   .standard-doc-stage {

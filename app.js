@@ -520,9 +520,25 @@ function toggleStandardPanel() {
 }
 
 function handleStandardPanelClick(event) {
+  const shortcutGuideButton = event.target.closest("[data-shortcut-guide]");
+  if (shortcutGuideButton) {
+    openShortcutGuide();
+    return;
+  }
+
   const button = event.target.closest("[data-standard-doc]");
   if (!button) return;
   openStandardDocumentViewer(button.dataset.standardDoc);
+}
+
+function openShortcutGuide() {
+  lastPhotoViewerTrigger = document.activeElement;
+  elements.photoViewer.setAttribute("aria-label", "휴대폰 바탕화면 바로가기 생성 안내");
+  elements.photoViewerImage.src = "./assets/mobile-home-shortcut-guide.jpg?v=20260728-1";
+  elements.photoViewerImage.alt = "브라우저와 크롬에서 바탕화면 바로가기를 생성하는 방법";
+  elements.photoViewer.hidden = false;
+  document.body.classList.add("viewer-open");
+  elements.photoViewerClose.focus();
 }
 
 function handleGlobalKeydown(event) {
@@ -4330,6 +4346,7 @@ function openPhotoViewer(day, photoType = activePhotoType) {
   if (!photo.photoUrl) return;
 
   lastPhotoViewerTrigger = document.activeElement;
+  elements.photoViewer.setAttribute("aria-label", "사진 크게 보기");
   elements.photoViewerImage.src = photo.photoUrl;
   elements.photoViewerImage.alt = `${getPhotoSlotLabel(day, normalizedType)} ${typeConfig.label} 사진`;
   elements.photoViewer.hidden = false;
