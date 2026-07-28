@@ -235,7 +235,6 @@ let entryLoadSequence = 0;
 let printPreviewRenderToken = 0;
 let printPreviewTimer = null;
 let isPrintPreviewNearViewport = false;
-let hasPrintPreviewScrollActivity = false;
 let printPreviewVisibilityFrame = 0;
 let activePhotoType = DEFAULT_PHOTO_TYPE;
 let pasteTargetDay = null;
@@ -4558,28 +4557,46 @@ function renderDayGrid() {
   }
 }
 
+const PRINT_PREVIEW_VIEWPORT_MARGIN_PX = 200;
+
 function setupPrintPreviewVisibility() {
   if (!elements.printArea) return;
   const previewSection = elements.printArea.closest(".preview-section") || elements.printArea;
+
+  const setNearViewport = (near) => {
+    const wasNearViewport = isPrintPreviewNearViewport;
+    isPrintPreviewNearViewport = Boolean(near);
+    if (isPrintPreviewNearViewport && !wasNearViewport) renderPrintArea();
+  };
+
+  // 예전에는 "스크롤이 한 번이라도 일어났는가"를 조건에 넣어서,
+  // 세로 모니터처럼 페이지가 한 화면에 다 들어가면 스크롤 이벤트가 아예 발생하지 않아
+  // 미리보기가 계속 "아래로 이동하면..." 상태로 남았습니다.
+  // 화면에 보이는지만 보고 판단합니다.
+  if (typeof window.IntersectionObserver === "function") {
+    const observer = new window.IntersectionObserver(
+      (entries) => entries.forEach((entry) => setNearViewport(entry.isIntersecting)),
+      { rootMargin: `${PRINT_PREVIEW_VIEWPORT_MARGIN_PX}px 0px` },
+    );
+    observer.observe(previewSection);
+    return;
+  }
+
   const updateVisibility = () => {
     printPreviewVisibilityFrame = 0;
     const rect = previewSection.getBoundingClientRect();
-    const wasNearViewport = isPrintPreviewNearViewport;
-    isPrintPreviewNearViewport = hasPrintPreviewScrollActivity
-      && rect.top < window.innerHeight * 0.85
-      && rect.bottom > 0;
-    if (isPrintPreviewNearViewport && !wasNearViewport) renderPrintArea();
+    setNearViewport(
+      rect.top < window.innerHeight + PRINT_PREVIEW_VIEWPORT_MARGIN_PX
+      && rect.bottom > -PRINT_PREVIEW_VIEWPORT_MARGIN_PX,
+    );
   };
   const scheduleVisibilityUpdate = () => {
     if (printPreviewVisibilityFrame) return;
     printPreviewVisibilityFrame = window.requestAnimationFrame(updateVisibility);
   };
-  const handleScroll = () => {
-    hasPrintPreviewScrollActivity = true;
-    scheduleVisibilityUpdate();
-  };
-  window.addEventListener("scroll", handleScroll, { passive: true });
+  window.addEventListener("scroll", scheduleVisibilityUpdate, { passive: true });
   window.addEventListener("resize", scheduleVisibilityUpdate, { passive: true });
+  scheduleVisibilityUpdate();
 }
 
 function renderPrintArea() {
@@ -4602,8 +4619,10 @@ function renderPrintArea() {
   elements.printArea.innerHTML = `<div class="print-render-loading">출력 미리보기 준비 중</div>`;
   printPreviewTimer = window.setTimeout(async () => {
     try {
-      const { images } = await getPrintPageImages(token);
-      if (token !== printPreviewRenderToken) return;
+      const { images, signature: builtSignature } = await getPrintPageImages();
+      // 만드는 사이에 내용이 바뀌었으면 버리고, 그대로면 그립니다.
+      // (다른 렌더가 끼어들었는지는 따지지 않습니다 — 결과물은 여전히 유효합니다.)
+      if (!builtSignature || builtSignature !== getPrintImageSignature()) return;
       renderPrintPreviewImages(images);
     } catch (error) {
       console.error(error);
@@ -4745,21 +4764,24 @@ function getPrintPreviewScale() {
 }
 
 // 화면 미리보기용(캐시함)
-async function getPrintPageImages(renderToken = 0) {
+async function getPrintPageImages() {
   const signature = getPrintImageSignature();
   if (printImageCache.signature === signature && Array.isArray(printImageCache.images)) {
-    return { images: printImageCache.images, failedCount: printImageCache.failedCount || 0 };
+    return { images: printImageCache.images, failedCount: printImageCache.failedCount || 0, signature };
   }
 
   const result = await buildPrintPageImages({
     scale: getPrintPreviewScale(),
     quality: PRINT_PREVIEW_JPEG_QUALITY,
-    shouldAbort: () => Boolean(renderToken) && renderToken !== printPreviewRenderToken,
+    // 중단 기준은 "내용이 바뀌었는가"입니다.
+    // 렌더 토큰으로 판단하면 다른 렌더가 잠깐 끼어들기만 해도 다 만든 결과를 버리고
+    // 캐시도 못 채워서, 렌더가 잦을 때 미리보기가 "준비 중"에서 안 넘어갑니다.
+    shouldAbort: () => getPrintImageSignature() !== signature,
   });
-  if (result.aborted) return { images: [], failedCount: 0 };
+  if (result.aborted) return { images: [], failedCount: 0, signature: "" };
 
   printImageCache = { signature, images: result.images, failedCount: result.failedCount };
-  return { images: result.images, failedCount: result.failedCount };
+  return { images: result.images, failedCount: result.failedCount, signature };
 }
 
 // PDF/인쇄용(고해상도). 사용자가 버튼을 누른 순간에만 만들고 캐시하지 않습니다.
