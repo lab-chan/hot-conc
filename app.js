@@ -84,6 +84,7 @@ const PRINT_PREVIEW_JPEG_QUALITY = 0.86;
 // 타설부위를 타이핑하는 동안 미리보기를 계속 다시 그리지 않도록 여유를 둡니다.
 const PRINT_PREVIEW_DEBOUNCE_MS = 400;
 let printMmScale = PRINT_MM_SCALE_EXPORT;
+let printTextMeasureContext = null;
 const PRINT_PAGE_WIDTH_MM = 210;
 const PRINT_PAGE_HEIGHT_MM = 297;
 const PRINT_TABLE_WIDTH_MM = 152.02;
@@ -95,7 +96,6 @@ const PRINT_DAY_WIDTH_MM = 16.08;
 const PRINT_PHOTO_ROW_HEIGHT_MM = 84;
 const PRINT_INFO_ROW_HEIGHT_MM = 10.525;
 const DELETED_BOARD_PROJECT_NAME = "__deleted_photo_board__";
-const DELETED_BOARD_LABEL = "[삭제됨]";
 const HIDDEN_BOARD_CODES_STORAGE_KEY = "concrete-photo-board-ui:hidden-board-codes";
 const PRINT_PHOTO_WIDTH_MM = 120;
 const PRINT_PHOTO_HEIGHT_MM = 80;
@@ -171,10 +171,12 @@ const elements = {
   storageMeterText: document.getElementById("storageMeterText"),
   storageMeterBar: document.getElementById("storageMeterBar"),
   boardListSection: document.getElementById("boardListSection"),
+  mainLayout: document.querySelector(".layout"),
   boardListExpandButton: document.getElementById("boardListExpandButton"),
   boardList: document.getElementById("boardList"),
   projectNameInput: document.getElementById("projectNameInput"),
   pourPartInput: document.getElementById("pourPartInput"),
+  pourPartLineBreakButton: document.getElementById("pourPartLineBreakButton"),
   pourDateInput: document.getElementById("pourDateInput"),
   prevPourDateButton: document.getElementById("prevPourDateButton"),
   nextPourDateButton: document.getElementById("nextPourDateButton"),
@@ -205,16 +207,19 @@ let metaSaveTimer = null;
 let isMetaSaveInProgress = false;
 let metaSavePromise = null;
 let pendingMetaSaveOptions = null;
+let metaDraftSaveWarningShown = false;
 let atomicPhotoRpcAvailable = null;
 let atomicDeleteMarkRpcAvailable = null;
 let atomicDeletePurgeRpcAvailable = null;
 let boardSettingsColumnAvailable = null;
 let boardSettingsSaveChain = Promise.resolve();
+let activeBoardSettingsWrite = null;
 let boardSettingsRevision = 0;
 let boardSettingsSaveCount = 0;
+const pendingBoardSettingsContexts = new Set();
 let deletedBoardCleanupPromise = null;
 const deletedBoardCleanupRetryAt = new Map();
-let lastSyncedMeta = { projectName: "", pourPart: "", pourDate: "" };
+let lastSyncedMeta = { projectName: "", pourPart: "", pourDate: "", updatedAt: "" };
 let boardList = [];
 let boardSearchQuery = "";
 let isBoardResultPanelOpen = loadBoardResultPanelOpen();
@@ -222,6 +227,10 @@ let boardResultViewMode = loadBoardResultViewMode();
 let boardResultSelectedGroup = null;
 let boardListRenderFrame = 0;
 let isBoardSearchComposing = false;
+let isPourPartComposing = false;
+let pendingPourPartLineBreak = false;
+let suppressPourPartCommitSave = false;
+let deferPourPartSaveFromLineBreakFocus = false;
 let isFilePickerOpen = false;
 let filePickerClearTimer = null;
 let pendingRealtimeRefresh = false;
@@ -230,6 +239,7 @@ let pendingRealtimeListRefresh = false;
 let realtimeRefreshTimer = null;
 let isRealtimeRefreshInProgress = false;
 let activePhotoMutationCount = 0;
+let printLockedControlStates = [];
 let boardLoadToken = 0;
 let entryLoadSequence = 0;
 let printPreviewRenderToken = 0;
@@ -257,6 +267,7 @@ let state = {
   pourPart: "",
   pourDate: "",
   createdAt: "",
+  updatedAt: "",
   entries: {},
   settings: createDefaultBoardSettings(),
 };
@@ -364,19 +375,45 @@ function bindEvents() {
   });
   [elements.projectNameInput, elements.pourPartInput, elements.pourDateInput].forEach((input) => {
     input.addEventListener("input", () => {
-      pullMetaFromInputs();
-      saveMetaDraft();
-      queueMetaSave();
-      // 현장명·타설부위는 일차 카드에 영향이 없습니다.
-      // 글자 하나마다 dayGrid를 통째로 다시 만들면 사진 <img>가 매번 재생성돼 입력이 끊깁니다.
-      if (input === elements.pourDateInput) {
-        renderMetaPreview();
-      } else {
-        renderPrintArea();
-      }
+      if (input === elements.pourPartInput && (isPourPartComposing || suppressPourPartCommitSave)) return;
+      handleMetaInputChange(input);
     });
-    input.addEventListener("change", flushMetaSave);
-    input.addEventListener("blur", flushMetaSave);
+    input.addEventListener("change", () => {
+      // textarea는 input에서 자동저장 예약, blur에서 확정하므로 change 저장은 중복입니다.
+      if (input === elements.pourPartInput) return;
+      flushMetaSave();
+    });
+    input.addEventListener("blur", (event) => {
+      if (input === elements.pourPartInput && suppressPourPartCommitSave) return;
+      if (input === elements.pourPartInput && event.relatedTarget === elements.pourPartLineBreakButton) {
+        deferPourPartSaveFromLineBreakFocus = true;
+        return;
+      }
+      if (input === elements.pourPartInput) deferPourPartSaveFromLineBreakFocus = false;
+      flushMetaSave();
+    });
+  });
+  elements.pourPartInput.addEventListener("compositionstart", () => {
+    isPourPartComposing = true;
+  });
+  elements.pourPartInput.addEventListener("compositionend", () => {
+    isPourPartComposing = false;
+    if (pendingPourPartLineBreak) {
+      window.setTimeout(completePendingPourPartLineBreak, 0);
+      return;
+    }
+    handleMetaInputChange(elements.pourPartInput);
+  });
+  elements.pourPartLineBreakButton?.addEventListener("pointerdown", (event) => {
+    // 버튼을 눌러도 입력란의 커서 위치가 사라지지 않게 합니다.
+    event.preventDefault();
+  });
+  elements.pourPartLineBreakButton?.addEventListener("click", insertPourPartLineBreak);
+  elements.pourPartLineBreakButton?.addEventListener("blur", (event) => {
+    if (!deferPourPartSaveFromLineBreakFocus) return;
+    if (event.relatedTarget === elements.pourPartInput) return;
+    deferPourPartSaveFromLineBreakFocus = false;
+    flushMetaSave();
   });
 
   window.addEventListener("pagehide", () => {
@@ -491,6 +528,7 @@ function setPasteTarget(day) {
 }
 
 async function handleClipboardPaste(event) {
+  if (event.target?.closest?.("input, textarea, [contenteditable='true']")) return;
   const items = event.clipboardData && event.clipboardData.items;
   if (!items) return;
 
@@ -568,6 +606,17 @@ function openShortcutGuide() {
 }
 
 function handleGlobalKeydown(event) {
+  if (
+    (event.ctrlKey || event.metaKey) &&
+    String(event.key || "").toLowerCase() === "p" &&
+    elements.photoViewer.hidden &&
+    elements.standardDocViewer.hidden
+  ) {
+    event.preventDefault();
+    handlePrint().catch(console.error);
+    return;
+  }
+
   if (!elements.photoViewer.hidden) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1009,10 +1058,11 @@ function resetCurrentBoard(options = {}) {
     pourPart: "",
     pourDate: toDateInputValue(new Date()),
     createdAt: "",
+    updatedAt: "",
     entries: {},
     settings: createDefaultBoardSettings(),
   };
-  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
+  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate, updatedAt: "" };
   syncInputsFromState();
 }
 
@@ -1026,6 +1076,7 @@ function loadLocalBoard() {
     pourPart: "",
     pourDate: toDateInputValue(new Date()),
     createdAt: "",
+    updatedAt: "",
     entries: {},
     settings: loadBoardSettingsFallback(shareCode) || getLegacyBoardSettings(),
   };
@@ -1044,6 +1095,7 @@ function loadLocalBoard() {
         }),
       };
       state.projectName = normalizeProjectName(state.projectName);
+      state.pourPart = normalizePourPartValue(state.pourPart);
     } catch (error) {
       console.warn("Local board parse failed", error);
     }
@@ -1053,16 +1105,25 @@ function loadLocalBoard() {
     state.pourDate = toDateInputValue(new Date());
   }
 
-  applyMetaDraft("");
-  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
+  lastSyncedMeta = {
+    projectName: state.projectName,
+    pourPart: state.pourPart,
+    pourDate: state.pourDate,
+    updatedAt: state.updatedAt || "",
+  };
+  const usedDraft = applyMetaDraft(state.updatedAt || "");
   syncInputsFromState();
-  saveLocalBoard();
+  if (usedDraft || !saved) {
+    const savedLocalBoard = saveLocalBoard();
+    if (usedDraft && savedLocalBoard) clearMetaDraft();
+  }
 }
 
 async function loadCloudBoard(options = {}) {
   const requestedShareCode = state.shareCode;
   const requestedEntrySequence = ++entryLoadSequence;
   const shouldSyncInputs = options.syncInputs !== false;
+  const shouldApplyDraft = options.applyDraft !== false;
   const createIfMissing = options.createIfMissing === true;
   if (loadHiddenBoardCodes().has(requestedShareCode)) {
     resetCurrentBoard({ keepShareCode: true });
@@ -1088,11 +1149,12 @@ async function loadCloudBoard(options = {}) {
 
     state.boardId = board.id;
     state.projectName = normalizeProjectName(board.project_name || DEFAULT_PROJECT_NAME);
-    state.pourPart = board.pour_part || "";
+    state.pourPart = normalizePourPartValue(board.pour_part);
     state.pourDate = board.pour_date || toDateInputValue(new Date());
     state.createdAt = board.created_at || "";
+    state.updatedAt = board.updated_at || "";
     state.settings = getBoardSettingsForRecord(board, requestedShareCode);
-    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
+    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate, updatedAt: state.updatedAt };
   } else if (createIfMissing) {
     const createPayload = {
       share_code: requestedShareCode,
@@ -1123,16 +1185,19 @@ async function loadCloudBoard(options = {}) {
 
     state.boardId = created.id;
     state.projectName = normalizeProjectName(created.project_name || DEFAULT_PROJECT_NAME);
-    state.pourPart = created.pour_part || "";
+    state.pourPart = normalizePourPartValue(created.pour_part);
     state.pourDate = created.pour_date || toDateInputValue(new Date());
     state.createdAt = created.created_at || "";
+    state.updatedAt = created.updated_at || "";
     state.settings = getBoardSettingsForRecord(created, requestedShareCode);
-    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
+    lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate, updatedAt: state.updatedAt };
   } else {
     resetCurrentBoard({ keepShareCode: true });
   }
 
-  const usedDraft = shouldSyncInputs && (board || createIfMissing) ? applyMetaDraft(board?.updated_at || "") : false;
+  const usedDraft = shouldSyncInputs && shouldApplyDraft && (board || createIfMissing)
+    ? applyMetaDraft(state.updatedAt || "")
+    : false;
   if (!board && !createIfMissing) {
     clearMetaDraft();
   }
@@ -1258,9 +1323,8 @@ function saveHiddenBoardCode(shareCode) {
 
 function isDeletedBoardRecord(board) {
   const projectName = board?.project_name ?? board?.projectName ?? "";
-  const pourPart = board?.pour_part ?? board?.pourPart ?? "";
   const deletedAt = board?.deleted_at ?? board?.deletedAt ?? "";
-  return Boolean(deletedAt) || projectName === DELETED_BOARD_PROJECT_NAME || String(pourPart).startsWith(DELETED_BOARD_LABEL);
+  return Boolean(deletedAt) || projectName === DELETED_BOARD_PROJECT_NAME;
 }
 
 async function loadCloudBoardList() {
@@ -1281,7 +1345,7 @@ async function loadCloudBoardList() {
   boardList = (data || []).filter((board) => {
     return board.share_code && board.pour_date && !hiddenBoardCodes.has(board.share_code) && !isDeletedBoardRecord(board);
   }).map((board) => {
-    const pourPart = board.pour_part || "미입력";
+    const pourPart = normalizePourPartValue(board.pour_part);
     // 서버 원본 행을 그대로 두면 렌더할 때마다 memo를 다시 JSON.parse 하게 됩니다.
     // 목록을 받는 시점에 한 번만 정규화해 둡니다.
     const entries = cloudRowsToEntries(board.photo_entries || []);
@@ -1311,10 +1375,11 @@ function updateCurrentBoardSummaryFromState() {
 
   current.boardId = state.boardId || current.boardId;
   current.projectName = normalizeProjectName(state.projectName || DEFAULT_PROJECT_NAME);
-  current.pourPart = state.pourPart || "미입력";
+  current.pourPart = normalizePourPartValue(state.pourPart);
   current.searchText = normalizeSearchText(current.pourPart);
   current.pourDate = state.pourDate || current.pourDate;
   current.createdAt = state.createdAt || current.createdAt;
+  current.updatedAt = state.updatedAt || current.updatedAt;
   current.entries = state.entries;
   current.settings = normalizeBoardSettings(state.settings);
   current.completedCount = countCompletedEntries(state.entries, PHOTO_TYPES.CURING, null, { pourDate: state.pourDate });
@@ -1371,7 +1436,7 @@ function loadLocalBoardList() {
       try {
         const parsed = JSON.parse(localStorage.getItem(key) || "{}");
         const entries = parsed.entries || {};
-        const pourPart = parsed.pourPart || "미입력";
+        const pourPart = normalizePourPartValue(parsed.pourPart);
         const shareCode = key.slice(LOCAL_PREFIX.length);
         const settings = normalizeBoardSettings(parsed.settings, {
           fallback: loadBoardSettingsFallback(shareCode) || getLegacyBoardSettings(),
@@ -1498,7 +1563,7 @@ function applyRealtimeBoardListChange(payload) {
   }
 
   if (!existing) {
-    const pourPart = row.pour_part || "미입력";
+    const pourPart = normalizePourPartValue(row.pour_part);
     boardList.push({
       boardId: row.id,
       shareCode: row.share_code,
@@ -1528,7 +1593,9 @@ function applyRealtimeBoardListChange(payload) {
   ]);
   existing.shareCode = row.share_code || existing.shareCode;
   existing.projectName = normalizeProjectName(row.project_name || existing.projectName || DEFAULT_PROJECT_NAME);
-  existing.pourPart = row.pour_part || existing.pourPart || "미입력";
+  if (Object.prototype.hasOwnProperty.call(row, "pour_part")) {
+    existing.pourPart = normalizePourPartValue(row.pour_part);
+  }
   existing.searchText = normalizeSearchText(existing.pourPart);
   existing.pourDate = row.pour_date || existing.pourDate;
   existing.createdAt = row.created_at || existing.createdAt;
@@ -1595,6 +1662,7 @@ function sortBoardListInPlace() {
 
 function syncInputsFromState() {
   state.projectName = normalizeProjectName(state.projectName);
+  state.pourPart = normalizePourPartValue(state.pourPart);
   elements.projectNameInput.value = state.projectName || DEFAULT_PROJECT_NAME;
   elements.pourPartInput.value = state.pourPart || "";
   elements.pourDateInput.value = state.pourDate || "";
@@ -1602,8 +1670,52 @@ function syncInputsFromState() {
 
 function pullMetaFromInputs() {
   state.projectName = normalizeProjectName(elements.projectNameInput.value || DEFAULT_PROJECT_NAME);
-  state.pourPart = elements.pourPartInput.value;
+  state.pourPart = normalizePourPartValue(elements.pourPartInput.value);
   state.pourDate = elements.pourDateInput.value || "";
+}
+
+function handleMetaInputChange(input) {
+  pullMetaFromInputs();
+  saveMetaDraft();
+  queueMetaSave();
+  // 현장명·타설부위는 일차 카드에 영향이 없습니다.
+  // 글자 하나마다 dayGrid를 통째로 다시 만들면 사진 <img>가 매번 재생성돼 입력이 끊깁니다.
+  if (input === elements.pourDateInput) {
+    renderMetaPreview();
+  } else {
+    renderPrintArea();
+  }
+}
+
+function insertPourPartLineBreak() {
+  const input = elements.pourPartInput;
+  if (!input) return;
+  deferPourPartSaveFromLineBreakFocus = false;
+  if (isPourPartComposing) {
+    pendingPourPartLineBreak = true;
+    suppressPourPartCommitSave = true;
+    // 모바일 한글 키보드의 마지막 조합 문자를 먼저 확정한 뒤 같은 커서 위치에 줄바꿈합니다.
+    input.blur();
+    window.setTimeout(() => {
+      if (!pendingPourPartLineBreak) return;
+      isPourPartComposing = false;
+      completePendingPourPartLineBreak();
+    }, 50);
+    return;
+  }
+
+  const start = Number.isInteger(input.selectionStart) ? input.selectionStart : input.value.length;
+  const end = Number.isInteger(input.selectionEnd) ? input.selectionEnd : start;
+  input.setRangeText("\n", start, end, "end");
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.focus();
+}
+
+function completePendingPourPartLineBreak() {
+  if (!pendingPourPartLineBreak) return;
+  pendingPourPartLineBreak = false;
+  suppressPourPartCommitSave = false;
+  insertPourPartLineBreak();
 }
 
 function queueMetaSave() {
@@ -1616,7 +1728,9 @@ function flushMetaSave(options = {}) {
   saveMetaDraft();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
-  saveMeta({ ...options, allowConfirm: options.silent ? false : options.allowConfirm !== false }).catch(console.error);
+  const promise = saveMeta({ ...options, allowConfirm: options.silent ? false : options.allowConfirm !== false });
+  promise.catch(console.error);
+  return promise;
 }
 
 function saveMeta(options = {}) {
@@ -1666,6 +1780,14 @@ async function saveMetaOnce(options = {}) {
   try {
   pullMetaFromInputs();
 
+  if (dbClient && state.boardId) {
+    const waitingShareCode = state.shareCode;
+    const waitingBoardId = state.boardId;
+    await waitForActiveBoardSettingsWrite(waitingBoardId);
+    if (state.shareCode !== waitingShareCode || state.boardId !== waitingBoardId) return;
+    pullMetaFromInputs();
+  }
+
   if (!state.pourDate) {
     state.pourDate = lastSyncedMeta.pourDate || toDateInputValue(new Date());
     elements.pourDateInput.value = state.pourDate;
@@ -1690,7 +1812,10 @@ async function saveMetaOnce(options = {}) {
     pourDate: saveContext.pourDate !== syncedAtStart.pourDate,
   };
   const hasMetaChange = Object.values(dirtyFields).some(Boolean);
-  if (!hasMetaChange) return;
+  if (!hasMetaChange) {
+    clearMetaDraft(saveContext.shareCode);
+    return;
+  }
 
   if (countPhotoEntries(state.entries || {}) > 0 && metaChangedFromSynced(saveContext, syncedAtStart)) {
     if (!allowConfirm) return;
@@ -1712,12 +1837,61 @@ async function saveMetaOnce(options = {}) {
     if (dirtyFields.projectName) updatePayload.project_name = saveContext.projectName;
     if (dirtyFields.pourPart) updatePayload.pour_part = saveContext.pourPart;
     if (dirtyFields.pourDate) updatePayload.pour_date = saveContext.pourDate || null;
-    const { data: savedBoard, error } = await dbClient
-      .from("photo_boards")
-      .update(updatePayload)
-      .eq("id", saveContext.boardId)
-      .select("project_name, pour_part, pour_date, updated_at")
-      .maybeSingle();
+    updatePayload.updated_at = createClientRevisionTimestamp(syncedAtStart.updatedAt);
+
+    const saveCloudMeta = async ({ expectedUpdatedAt = "", checkRevision = true } = {}) => {
+      let query = dbClient
+        .from("photo_boards")
+        .update(updatePayload)
+        .eq("id", saveContext.boardId);
+      if (checkRevision) {
+        query = expectedUpdatedAt
+          ? query.eq("updated_at", expectedUpdatedAt)
+          : query.is("updated_at", null);
+      }
+      const selectColumns = boardSettingsColumnAvailable === true
+        ? "project_name, pour_part, pour_date, updated_at, settings"
+        : "project_name, pour_part, pour_date, updated_at";
+      return query
+        .select(selectColumns)
+        .maybeSingle();
+    };
+
+    let overwroteSaveConflict = false;
+    let appliedRemoteSettings = false;
+    let { data: savedBoard, error } = await saveCloudMeta({
+      expectedUpdatedAt: syncedAtStart.updatedAt || "",
+    });
+
+    const hasSaveConflict = !error && !savedBoard;
+    if (hasSaveConflict) {
+      if (!allowConfirm) return;
+
+      const overwriteRemote = window.confirm(
+        "다른 기기에서 사진대지 정보가 변경되었습니다.\n\n" +
+        "이 기기의 입력 내용으로 덮어쓸까요?\n\n" +
+        "[확인] 이 기기 내용으로 저장\n[취소] 다른 기기 내용 불러오기"
+      );
+      if (!overwriteRemote) {
+        const cancelledSettingsCount = boardSettingsColumnAvailable === true
+          ? cancelPendingBoardSettingsContexts(saveContext.boardId)
+          : 0;
+        if (isCurrentBoard(saveContext)) {
+          await loadCloudBoard({ syncInputs: true, applyDraft: false });
+          clearMetaDraft(saveContext.shareCode);
+          renderMetaPreview();
+        } else {
+          clearMetaDraft(saveContext.shareCode);
+        }
+        if (cancelledSettingsCount > 0) {
+          showToast("서버의 최신 정보와 일차 설정을 불러왔습니다. 저장 전 설정 변경은 다시 시도해 주세요.");
+        }
+        return;
+      }
+
+      overwroteSaveConflict = true;
+      ({ data: savedBoard, error } = await saveCloudMeta({ checkRevision: false }));
+    }
 
     if (error || !savedBoard) {
       console.error(error);
@@ -1727,25 +1901,45 @@ async function saveMetaOnce(options = {}) {
 
     const savedMeta = {
       projectName: normalizeProjectName(savedBoard.project_name || DEFAULT_PROJECT_NAME),
-      pourPart: savedBoard.pour_part || "",
+      pourPart: normalizePourPartValue(savedBoard.pour_part),
       pourDate: savedBoard.pour_date || saveContext.pourDate,
+      updatedAt: savedBoard.updated_at || syncedAtStart.updatedAt || "",
     };
     clearMetaDraftIfMatches(saveContext.shareCode, saveContext);
+    rebaseMetaDraftRevision(saveContext.shareCode, syncedAtStart.updatedAt, savedMeta.updatedAt);
+    const cancelledSettingsCount = overwroteSaveConflict && boardSettingsColumnAvailable === true
+      ? cancelPendingBoardSettingsContexts(saveContext.boardId)
+      : 0;
     if (isCurrentBoard(saveContext)) {
       applySavedMetaResponse(saveContext, syncedAtStart, savedMeta, dirtyFields);
+      state.updatedAt = savedMeta.updatedAt;
       lastSyncedMeta = savedMeta;
+      if (overwroteSaveConflict && Object.prototype.hasOwnProperty.call(savedBoard, "settings")) {
+        state.settings = getBoardSettingsForRecord(savedBoard, saveContext.shareCode);
+        updateBoardListSettings(saveContext.shareCode, state.settings);
+        appliedRemoteSettings = true;
+      }
     }
     await syncCurrentBoardIntoList({ resort: dirtyFields.pourDate });
-    renderBoardList();
-    renderStorageMeter();
+    if (appliedRemoteSettings) {
+      renderAll();
+    } else {
+      renderBoardList();
+      renderStorageMeter();
+    }
+    if (cancelledSettingsCount > 0) {
+      showToast("서버의 최신 일차 설정을 반영했습니다. 저장 전 설정 변경은 다시 시도해 주세요.");
+    }
   } else {
-    saveLocalBoard();
+    const saved = saveLocalBoard();
+    if (!saved) return;
     clearMetaDraftIfMatches(saveContext.shareCode, saveContext);
     if (isCurrentBoard(saveContext)) {
       lastSyncedMeta = {
         projectName: saveContext.projectName,
         pourPart: saveContext.pourPart,
         pourDate: saveContext.pourDate,
+        updatedAt: state.updatedAt || "",
       };
     }
     await syncCurrentBoardIntoList({ resort: dirtyFields.pourDate });
@@ -1782,10 +1976,49 @@ function metaChangedFromSynced(meta = state, synced = lastSyncedMeta) {
   return meta.pourPart !== synced.pourPart || meta.pourDate !== synced.pourDate;
 }
 
+function isMetaDirty(meta = state, synced = lastSyncedMeta) {
+  return (
+    normalizeProjectName(meta.projectName || DEFAULT_PROJECT_NAME) !==
+      normalizeProjectName(synced.projectName || DEFAULT_PROJECT_NAME) ||
+    normalizePourPartValue(meta.pourPart) !== normalizePourPartValue(synced.pourPart) ||
+    String(meta.pourDate || "") !== String(synced.pourDate || "")
+  );
+}
+
+function createClientRevisionTimestamp(previousUpdatedAt = "") {
+  const previousTime = Date.parse(previousUpdatedAt || "");
+  const nextTime = Math.max(Date.now(), Number.isFinite(previousTime) ? previousTime + 1 : 0);
+  return new Date(nextTime).toISOString();
+}
+
+function beginActiveBoardSettingsWrite(boardId) {
+  let release;
+  const promise = new Promise((resolve) => {
+    release = resolve;
+  });
+  const token = { boardId, promise, release };
+  activeBoardSettingsWrite = token;
+  return token;
+}
+
+function endActiveBoardSettingsWrite(token) {
+  if (!token) return;
+  token.release();
+  if (activeBoardSettingsWrite === token) activeBoardSettingsWrite = null;
+}
+
+async function waitForActiveBoardSettingsWrite(boardId) {
+  const activeWrite = activeBoardSettingsWrite;
+  if (activeWrite && activeWrite.boardId === boardId) await activeWrite.promise;
+}
+
 function describeMetaChange(meta = state, synced = lastSyncedMeta) {
   const lines = [];
   if (meta.pourPart !== synced.pourPart) {
-    lines.push(`타설부위: ${synced.pourPart || "(미입력)"} → ${meta.pourPart || "(미입력)"}`);
+    lines.push(
+      `타설부위\n[기존]\n${normalizePourPartValue(synced.pourPart) || "(미입력)"}` +
+      `\n[변경]\n${normalizePourPartValue(meta.pourPart) || "(미입력)"}`
+    );
   }
   if (meta.pourDate !== synced.pourDate) {
     lines.push(`타설일: ${synced.pourDate || "(미입력)"} → ${meta.pourDate || "(미입력)"}`);
@@ -1801,6 +2034,11 @@ function revertMetaInputsToSynced(synced = lastSyncedMeta) {
 }
 
 function saveMetaDraft() {
+  if (!state.shareCode) return false;
+  if (!isMetaDirty(state, lastSyncedMeta)) {
+    clearMetaDraft(state.shareCode);
+    return false;
+  }
   try {
     localStorage.setItem(
       META_DRAFT_PREFIX + state.shareCode,
@@ -1808,11 +2046,19 @@ function saveMetaDraft() {
         projectName: state.projectName,
         pourPart: state.pourPart,
         pourDate: state.pourDate,
+        baseUpdatedAt: lastSyncedMeta.updatedAt || "",
         updatedAt: new Date().toISOString(),
       })
     );
+    metaDraftSaveWarningShown = false;
+    return true;
   } catch (error) {
     console.warn("Meta draft save failed", error);
+    if (!metaDraftSaveWarningShown) {
+      metaDraftSaveWarningShown = true;
+      showToast("입력 임시 저장에 실패했습니다. 이 화면을 닫지 말고 저장을 다시 시도해 주세요.");
+    }
+    return false;
   }
 }
 
@@ -1822,15 +2068,22 @@ function applyMetaDraft(remoteUpdatedAt) {
     if (!saved) return false;
 
     const draft = JSON.parse(saved);
+    const hasBaseRevision = Object.prototype.hasOwnProperty.call(draft, "baseUpdatedAt");
     const draftTime = Date.parse(draft.updatedAt || "");
     const remoteTime = Date.parse(remoteUpdatedAt || "");
-    if (remoteUpdatedAt && (!draftTime || draftTime <= remoteTime)) {
+    if (hasBaseRevision && String(draft.baseUpdatedAt || "") !== String(remoteUpdatedAt || "")) {
+      const useDraft = window.confirm(
+        "다른 기기에서 사진대지 정보가 변경되었습니다.\n\n이 기기에 남아 있는 미저장 입력을 다시 불러올까요?"
+      );
+      if (!useDraft) clearMetaDraft();
+      if (!useDraft) return false;
+    } else if (!hasBaseRevision && remoteUpdatedAt && (!draftTime || draftTime <= remoteTime)) {
       clearMetaDraft();
       return false;
     }
 
     state.projectName = normalizeProjectName(draft.projectName || DEFAULT_PROJECT_NAME);
-    state.pourPart = typeof draft.pourPart === "string" ? draft.pourPart : "";
+    state.pourPart = normalizePourPartValue(draft.pourPart);
     state.pourDate = draft.pourDate || state.pourDate || toDateInputValue(new Date());
     return true;
   } catch (error) {
@@ -1856,11 +2109,26 @@ function clearMetaDraftIfMatches(shareCode, meta) {
     const draft = JSON.parse(saved);
     const matches =
       normalizeProjectName(draft.projectName) === normalizeProjectName(meta.projectName) &&
-      String(draft.pourPart || "") === String(meta.pourPart || "") &&
+      normalizePourPartValue(draft.pourPart) === normalizePourPartValue(meta.pourPart) &&
       String(draft.pourDate || "") === String(meta.pourDate || "");
     if (matches) localStorage.removeItem(key);
   } catch (error) {
     console.warn("Meta draft cleanup failed", error);
+  }
+}
+
+function rebaseMetaDraftRevision(shareCode, previousUpdatedAt, nextUpdatedAt) {
+  if (!shareCode || !nextUpdatedAt || String(previousUpdatedAt || "") === String(nextUpdatedAt)) return;
+  try {
+    const key = META_DRAFT_PREFIX + shareCode;
+    const saved = localStorage.getItem(key);
+    if (!saved) return;
+    const draft = JSON.parse(saved);
+    if (String(draft.baseUpdatedAt || "") !== String(previousUpdatedAt || "")) return;
+    draft.baseUpdatedAt = nextUpdatedAt;
+    localStorage.setItem(key, JSON.stringify(draft));
+  } catch (error) {
+    console.warn("Meta draft revision rebase failed", error);
   }
 }
 
@@ -2028,6 +2296,7 @@ function saveLocalBoard() {
   if (!state.shareCode) return false;
 
   try {
+    const updatedAt = new Date().toISOString();
     localStorage.setItem(
       LOCAL_PREFIX + state.shareCode,
       JSON.stringify({
@@ -2035,11 +2304,19 @@ function saveLocalBoard() {
         pourPart: state.pourPart,
         pourDate: state.pourDate,
         createdAt: state.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        updatedAt,
         entries: normalizeEntries(state.entries),
         settings: normalizeBoardSettings(state.settings),
       })
     );
+    state.updatedAt = updatedAt;
+    lastSyncedMeta = {
+      projectName: normalizeProjectName(state.projectName || DEFAULT_PROJECT_NAME),
+      pourPart: normalizePourPartValue(state.pourPart),
+      pourDate: state.pourDate || "",
+      updatedAt,
+    };
+    clearMetaDraftIfMatches(state.shareCode, state);
     renderStorageMeter();
     return true;
   } catch (error) {
@@ -2419,11 +2696,11 @@ function getPhotoTypeConfig(photoType = activePhotoType) {
   return PHOTO_TYPE_CONFIG[normalizePhotoType(photoType)] || PHOTO_TYPE_CONFIG[DEFAULT_PHOTO_TYPE];
 }
 
-function getPhotoSlotLabel(slot, photoType = activePhotoType) {
+function getPhotoSlotLabel(slot, photoType = activePhotoType, settings = state.settings) {
   const normalizedType = normalizePhotoType(photoType);
   // 습윤양생 일차는 관리자가 지정한 사용자 이름을 우선 사용(없으면 "N일차").
   if (normalizedType === PHOTO_TYPES.CURING) {
-    const custom = getDaySlotCustomLabel(slot);
+    const custom = getDaySlotCustomLabel(slot, settings);
     if (custom) return custom;
   }
   const config = getPhotoTypeConfig(normalizedType);
@@ -2832,7 +3109,7 @@ function renderWeatherAuditPanel() {
         ${mismatches.map((record) => `
           <button class="weather-audit-record" type="button" data-weather-board-code="${escapeAttribute(record.board.shareCode)}">
             <span>${escapeHtml(record.date || "날짜 없음")}</span>
-            <strong>${escapeHtml(record.board.pourPart || "미입력")}</strong>
+            <strong>${escapeHtml(getPourPartInlineText(record.board.pourPart))}</strong>
             <small>${escapeHtml(`${record.dayNo}일차 · 0mm · 현장확인 필요`)}</small>
           </button>
         `).join("")}
@@ -3028,6 +3305,7 @@ function updateBoardSettings(mutator) {
   const context = {
     shareCode: state.shareCode,
     boardId: state.boardId,
+    updatedAt: state.updatedAt || lastSyncedMeta.updatedAt || "",
     revision: ++boardSettingsRevision,
     previous,
     next,
@@ -3039,7 +3317,10 @@ function updateBoardSettings(mutator) {
 
   const persist = () => persistBoardSettingsChange(context);
   boardSettingsSaveCount += 1;
-  const promise = boardSettingsSaveChain.then(persist, persist);
+  pendingBoardSettingsContexts.add(context);
+  const promise = boardSettingsSaveChain
+    .then(persist, persist)
+    .finally(() => pendingBoardSettingsContexts.delete(context));
   boardSettingsSaveChain = promise
     .catch(() => {})
     .finally(async () => {
@@ -3052,6 +3333,17 @@ function updateBoardSettings(mutator) {
 async function persistBoardSettingsChange(context) {
   let saved = false;
   let error = null;
+  let saveConflict = false;
+
+  if (context.cancelled) return false;
+
+  if (dbClient && context.boardId && metaSavePromise) {
+    await metaSavePromise;
+    if (context.cancelled) return false;
+    if (state.shareCode === context.shareCode && state.boardId === context.boardId) {
+      context.updatedAt = state.updatedAt || lastSyncedMeta.updatedAt || context.updatedAt;
+    }
+  }
 
   if (!dbClient || !context.boardId) {
     if (state.shareCode === context.shareCode) {
@@ -3060,20 +3352,45 @@ async function persistBoardSettingsChange(context) {
       saved = saveBoardSettingsFallback(context.shareCode, context.next);
     }
   } else if (boardSettingsColumnAvailable !== false) {
-    const result = await dbClient
-      .from("photo_boards")
-      .update({ settings: context.next })
-      .eq("id", context.boardId)
-      .select("id, settings")
-      .maybeSingle();
-    error = result.error;
-    if (error && isMissingBackendFeature(error, "settings")) {
-      boardSettingsColumnAvailable = false;
-      error = null;
-    } else if (!error) {
-      boardSettingsColumnAvailable = true;
-      saved = Boolean(result.data);
-      if (saved) clearBoardSettingsFallback(context.shareCode);
+    const activeWriteToken = beginActiveBoardSettingsWrite(context.boardId);
+    try {
+      const requestedUpdatedAt = createClientRevisionTimestamp(context.updatedAt);
+      let query = dbClient
+        .from("photo_boards")
+        .update({ settings: context.next, updated_at: requestedUpdatedAt })
+        .eq("id", context.boardId);
+      query = context.updatedAt
+        ? query.eq("updated_at", context.updatedAt)
+        : query.is("updated_at", null);
+      const result = await query.select("id, settings, updated_at").maybeSingle();
+      if (context.cancelled) {
+        const affectsCurrentBoard = state.shareCode === context.shareCode && state.boardId === context.boardId;
+        scheduleRealtimeRefresh({ refreshCurrentBoard: affectsCurrentBoard, refreshList: !affectsCurrentBoard });
+        return false;
+      }
+      error = result.error;
+      if (error && isMissingBackendFeature(error, "settings")) {
+        boardSettingsColumnAvailable = false;
+        error = null;
+      } else if (!error) {
+        boardSettingsColumnAvailable = true;
+        saved = Boolean(result.data);
+        saveConflict = !saved;
+        if (saved) {
+          clearBoardSettingsFallback(context.shareCode);
+          const savedUpdatedAt = result.data.updated_at || requestedUpdatedAt;
+          rebasePendingBoardSettingsContexts(context.boardId, context.updatedAt, savedUpdatedAt);
+          const board = boardList.find((item) => item.shareCode === context.shareCode);
+          if (board) board.updatedAt = savedUpdatedAt;
+          if (state.shareCode === context.shareCode && state.boardId === context.boardId) {
+            rebaseMetaDraftRevision(context.shareCode, context.updatedAt, savedUpdatedAt);
+            state.updatedAt = savedUpdatedAt;
+            lastSyncedMeta = { ...lastSyncedMeta, updatedAt: savedUpdatedAt };
+          }
+        }
+      }
+    } finally {
+      endActiveBoardSettingsWrite(activeWriteToken);
     }
   }
 
@@ -3082,6 +3399,15 @@ async function persistBoardSettingsChange(context) {
   }
 
   if (saved) return true;
+
+  if (saveConflict) {
+    cancelPendingBoardSettingsContexts(context.boardId);
+    await refreshBoardSettingsAfterConflict(context);
+    const affectsCurrentBoard = state.shareCode === context.shareCode && state.boardId === context.boardId;
+    scheduleRealtimeRefresh({ refreshCurrentBoard: affectsCurrentBoard, refreshList: !affectsCurrentBoard });
+    showToast("다른 기기에서 일차 설정이 변경되어 최신 설정을 다시 불러왔습니다. 필요한 변경을 다시 시도해 주세요.");
+    return false;
+  }
 
   if (error) console.error(error);
   if (
@@ -3095,6 +3421,53 @@ async function persistBoardSettingsChange(context) {
   }
   showToast("일차 설정을 저장하지 못했습니다. 다시 시도해 주세요.");
   return false;
+}
+
+function rebasePendingBoardSettingsContexts(boardId, previousUpdatedAt, nextUpdatedAt) {
+  if (!boardId || !nextUpdatedAt || String(previousUpdatedAt || "") === String(nextUpdatedAt)) return;
+  pendingBoardSettingsContexts.forEach((context) => {
+    if (context.boardId !== boardId) return;
+    if (String(context.updatedAt || "") !== String(previousUpdatedAt || "")) return;
+    context.updatedAt = nextUpdatedAt;
+  });
+}
+
+function cancelPendingBoardSettingsContexts(boardId) {
+  if (!boardId) return 0;
+  let cancelledCount = 0;
+  pendingBoardSettingsContexts.forEach((context) => {
+    if (context.boardId !== boardId || context.cancelled) return;
+    context.cancelled = true;
+    cancelledCount += 1;
+  });
+  return cancelledCount;
+}
+
+async function refreshBoardSettingsAfterConflict(context) {
+  if (!dbClient || !context?.boardId || boardSettingsColumnAvailable === false) return false;
+  try {
+    const { data, error } = await dbClient
+      .from("photo_boards")
+      .select("settings")
+      .eq("id", context.boardId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data || !Object.prototype.hasOwnProperty.call(data, "settings")) return false;
+
+    const settings = getBoardSettingsForRecord(data, context.shareCode);
+    updateBoardListSettings(context.shareCode, settings);
+    if (state.shareCode === context.shareCode && state.boardId === context.boardId) {
+      state.settings = settings;
+      printImageCache = { signature: "", images: [] };
+      renderAll();
+    } else {
+      renderBoardList();
+    }
+    return true;
+  } catch (refreshError) {
+    console.warn("Latest board settings refresh failed", refreshError);
+    return false;
+  }
 }
 
 // 읽기 전용 경로 전용 캐시입니다. normalizeBoardSettings는 호출마다 배열·객체를
@@ -3697,8 +4070,12 @@ function getEmptyPhotoText(day, photoType = activePhotoType) {
   return getPhotoTypeConfig(photoType).missingText;
 }
 
-function getPrintMissingPhotoText(day, photoType = activePhotoType) {
-  return getEmptyPhotoText(day, photoType);
+function getPrintMissingPhotoText(day, photoType = activePhotoType, entry = undefined, hasEntryOverride = false) {
+  if (!hasEntryOverride) return getEmptyPhotoText(day, photoType);
+  if (normalizePhotoType(photoType) === PHOTO_TYPES.CURING && isRainHoldEntry(entry)) {
+    return RAIN_HOLD_TEXT;
+  }
+  return getPhotoTypeConfig(photoType).missingText;
 }
 
 // 같은 memo 문자열을 반복해서 JSON.parse 하지 않도록 결과를 캐시합니다.
@@ -3891,7 +4268,13 @@ async function endPhotoMutation() {
 }
 
 function shouldDeferRealtimeRefresh() {
-  return isFilePickerOpen || activePhotoMutationCount > 0 || isMetaSaveInProgress || boardSettingsSaveCount > 0;
+  return (
+    isFilePickerOpen ||
+    activePhotoMutationCount > 0 ||
+    isMetaSaveInProgress ||
+    boardSettingsSaveCount > 0 ||
+    (isMetaInputFocused() && isMetaInputDirty())
+  );
 }
 
 async function flushPendingRealtimeRefresh() {
@@ -3910,7 +4293,10 @@ async function flushPendingRealtimeRefresh() {
   try {
     const inputFocused = isMetaInputFocused();
     if (refreshCurrentBoard && state.shareCode) {
-      await loadCloudBoard({ syncInputs: !inputFocused });
+      // 실제 편집 중이면 shouldDeferRealtimeRefresh()에서 이 경로에 들어오지 않습니다.
+      // 포커스만 있고 수정하지 않은 경우에는 원격값을 입력란까지 동기화해
+      // 오래된 화면값이 blur 때 다시 저장되는 일을 막습니다.
+      await loadCloudBoard({ syncInputs: true });
     }
     if (refreshList) {
       await loadBoardList();
@@ -3999,6 +4385,7 @@ function renderBoardList() {
 
 function renderBoardListItemHtml(board) {
   const active = board.shareCode === state.shareCode;
+  const pourPartText = getPourPartInlineText(board.pourPart);
   const progress = getBoardCuringProgress(board);
   const boardTemperatureSlots = getTemperatureSlotList(board.entries || {}, board.settings);
   const visibleTemperatureSet = new Set(boardTemperatureSlots);
@@ -4006,9 +4393,9 @@ function renderBoardListItemHtml(board) {
   const rainAudit = getRainAuditStats([board]);
   return `
     <div class="board-list-item ${active ? "active" : ""} ${progress.complete ? "" : "incomplete"}">
-      <button class="board-open-button" type="button" data-board-code="${escapeAttribute(board.shareCode)}" aria-current="${active ? "true" : "false"}" aria-label="${escapeAttribute(`${formatListDate(board.pourDate)} ${board.pourPart} 사진대지 열기`)}">
+      <button class="board-open-button" type="button" data-board-code="${escapeAttribute(board.shareCode)}" aria-current="${active ? "true" : "false"}" aria-label="${escapeAttribute(`${formatListDate(board.pourDate)} ${pourPartText} 사진대지 열기`)}">
         <span class="board-date">${escapeHtml(formatListDate(board.pourDate))}</span>
-        <span class="board-part">${escapeHtml(board.pourPart)}</span>
+        <span class="board-part">${escapeHtml(pourPartText)}</span>
         <span class="board-counts">
           <span class="board-count ${progress.complete ? "complete" : ""}">${progress.completed}/${progress.total} 양생</span>
           ${
@@ -4025,7 +4412,7 @@ function renderBoardListItemHtml(board) {
       </button>
       ${
         isAdminMode
-          ? `<button class="board-list-delete-button admin-only" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제" aria-label="${escapeAttribute(board.pourPart)} 사진대지 삭제">×</button>`
+          ? `<button class="board-list-delete-button admin-only" type="button" data-delete-board-code="${escapeAttribute(board.shareCode)}" title="사진대지 삭제" aria-label="${escapeAttribute(pourPartText)} 사진대지 삭제">×</button>`
           : ""
       }
     </div>
@@ -4601,12 +4988,15 @@ function setupPrintPreviewVisibility() {
 
 function renderPrintArea() {
   const token = ++printPreviewRenderToken;
+  const hasVisiblePreview = Boolean(elements.printArea.querySelector(".print-raster-page"));
 
   window.clearTimeout(printPreviewTimer);
 
   // 미리보기가 화면 밖이면 서명 계산(전체 entries JSON.stringify)도 하지 않습니다.
   if (!isPrintPreviewNearViewport) {
-    elements.printArea.innerHTML = `<div class="print-render-loading">아래로 이동하면 출력 미리보기를 준비합니다.</div>`;
+    if (!hasVisiblePreview) {
+      elements.printArea.innerHTML = `<div class="print-render-loading">아래로 이동하면 출력 미리보기를 준비합니다.</div>`;
+    }
     return;
   }
 
@@ -4616,7 +5006,9 @@ function renderPrintArea() {
     return;
   }
 
-  elements.printArea.innerHTML = `<div class="print-render-loading">출력 미리보기 준비 중</div>`;
+  if (!hasVisiblePreview) {
+    elements.printArea.innerHTML = `<div class="print-render-loading">출력 미리보기 준비 중</div>`;
+  }
   printPreviewTimer = window.setTimeout(async () => {
     try {
       const { images, signature: builtSignature } = await getPrintPageImages();
@@ -4705,11 +5097,51 @@ function closePhotoViewer() {
   lastPhotoViewerTrigger = null;
 }
 
-function getPrintImageSignature() {
-  const photoType = activePhotoType;
-  const printSlots = getPrintSlots(photoType);
-  const entries = days(photoType).map((day) => {
-    const entry = getEntry(day);
+function createPrintRenderContext(photoType = activePhotoType) {
+  const normalizedType = normalizePhotoType(photoType);
+  const entries = createPrintEntriesSnapshot(state.entries);
+  const settings = normalizeBoardSettings(state.settings);
+  const slots = getPhotoSlotList(normalizedType, entries, settings);
+  return {
+    shareCode: state.shareCode || "",
+    boardId: state.boardId || null,
+    projectName: normalizeProjectName(state.projectName || DEFAULT_PROJECT_NAME),
+    pourPart: normalizePourPartValue(state.pourPart),
+    pourDate: state.pourDate || "",
+    photoType: normalizedType,
+    entries,
+    settings,
+    slots,
+    printDayLabelBlind: loadPrintDayLabelBlindMode(),
+  };
+}
+
+function createPrintEntriesSnapshot(entries) {
+  const snapshot = {};
+  getEntryItems(entries).forEach(({ entry, dayNo }) => {
+    if (!dayNo || !entry) return;
+    const curingPhoto = getTypedPhoto(entry, PHOTO_TYPES.CURING);
+    const photos = {};
+    Object.values(PHOTO_TYPES).forEach((photoType) => {
+      if (photoType === PHOTO_TYPES.CURING) return;
+      photos[photoType] = { ...getTypedPhoto(entry, photoType) };
+    });
+    snapshot[dayNo] = {
+      dayNo,
+      ...curingPhoto,
+      rainHold: isRainHoldEntry(entry),
+      photos,
+    };
+  });
+  return snapshot;
+}
+
+function getPrintImageSignature(printContext = null) {
+  const photoType = printContext?.photoType || activePhotoType;
+  const printSlots = getPrintSlots(photoType, printContext);
+  const entriesSource = printContext?.entries || state.entries;
+  const entries = printSlots.map((day) => {
+    const entry = entriesSource?.[day] || {};
     const photo = getTypedPhoto(entry, photoType);
     return [
       day,
@@ -4724,29 +5156,32 @@ function getPrintImageSignature() {
 
   return JSON.stringify({
     photoType,
-    projectName: state.projectName || "",
-    pourPart: state.pourPart || "",
-    pourDate: state.pourDate || "",
+    projectName: printContext?.projectName ?? state.projectName ?? "",
+    pourPart: printContext?.pourPart ?? state.pourPart ?? "",
+    pourDate: printContext?.pourDate ?? state.pourDate ?? "",
     printSlots,
     entries,
-    dayLabels: getNormalizedBoardSettings(state.settings).dayLabels,
-    printDayLabelBlind: loadPrintDayLabelBlindMode(),
+    dayLabels: getNormalizedBoardSettings(printContext?.settings || state.settings).dayLabels,
+    printDayLabelBlind: printContext?.printDayLabelBlind ?? loadPrintDayLabelBlindMode(),
     // 브라우저 확대/모니터 이동으로 화소 밀도가 바뀌면 미리보기를 다시 그립니다.
     previewScale: getPrintPreviewScale(),
   });
 }
 
-function getPrintSlots(photoType = activePhotoType) {
+function getPrintSlots(photoType = activePhotoType, printContext = null) {
   const normalizedType = normalizePhotoType(photoType);
-  if (normalizedType === PHOTO_TYPES.CURING) return days(normalizedType);
+  const entries = printContext?.entries || state.entries;
+  const settings = printContext?.settings || state.settings;
+  const slots = printContext?.slots || getPhotoSlotList(normalizedType, entries, settings);
+  if (normalizedType === PHOTO_TYPES.CURING) return [...slots];
 
-  return days(normalizedType).filter((day) => hasEntryPhoto(getEntry(day), normalizedType));
+  return slots.filter((day) => hasEntryPhoto(entries?.[day] || {}, normalizedType));
 }
 
-function getPrintPageGroups(photoType = activePhotoType) {
+function getPrintPageGroups(photoType = activePhotoType, printContext = null) {
   const normalizedType = normalizePhotoType(photoType);
   // 일차 수에 맞춰 페이지 그룹을 동적으로 구성(페이지당 PRINT_PAGE_GROUP_SIZE일차).
-  const slots = getPrintSlots(normalizedType);
+  const slots = getPrintSlots(normalizedType, printContext);
   const groups = [];
   for (let index = 0; index < slots.length; index += PRINT_PAGE_GROUP_SIZE) {
     const group = slots.slice(index, index + PRINT_PAGE_GROUP_SIZE);
@@ -4765,7 +5200,8 @@ function getPrintPreviewScale() {
 
 // 화면 미리보기용(캐시함)
 async function getPrintPageImages() {
-  const signature = getPrintImageSignature();
+  const printContext = createPrintRenderContext();
+  const signature = getPrintImageSignature(printContext);
   if (printImageCache.signature === signature && Array.isArray(printImageCache.images)) {
     return { images: printImageCache.images, failedCount: printImageCache.failedCount || 0, signature };
   }
@@ -4773,6 +5209,7 @@ async function getPrintPageImages() {
   const result = await buildPrintPageImages({
     scale: getPrintPreviewScale(),
     quality: PRINT_PREVIEW_JPEG_QUALITY,
+    printContext,
     // 중단 기준은 "내용이 바뀌었는가"입니다.
     // 렌더 토큰으로 판단하면 다른 렌더가 잠깐 끼어들기만 해도 다 만든 결과를 버리고
     // 캐시도 못 채워서, 렌더가 잦을 때 미리보기가 "준비 중"에서 안 넘어갑니다.
@@ -4785,37 +5222,39 @@ async function getPrintPageImages() {
 }
 
 // PDF/인쇄용(고해상도). 사용자가 버튼을 누른 순간에만 만들고 캐시하지 않습니다.
-async function getPrintExportImages() {
+async function getPrintExportImages(printContext = createPrintRenderContext()) {
   const result = await buildPrintPageImages({
     scale: PRINT_MM_SCALE_EXPORT,
     quality: PRINT_EXPORT_JPEG_QUALITY,
+    printContext,
   });
   return { images: result.images, failedCount: result.failedCount };
 }
 
-async function buildPrintPageImages({ scale, quality, shouldAbort = null } = {}) {
-  const photoType = activePhotoType;
-  const groups = getPrintPageGroups(photoType);
-  const photos = await loadPrintPhotos(photoType);
+async function buildPrintPageImages({ scale, quality, shouldAbort = null, printContext = createPrintRenderContext() } = {}) {
+  const photoType = printContext.photoType;
+  const groups = getPrintPageGroups(photoType, printContext);
+  const photos = await loadPrintPhotos(photoType, printContext);
   if (shouldAbort && shouldAbort()) return { images: [], failedCount: 0, aborted: true };
 
   const failedCount = countPrintPhotoFailures(photos);
   const images = [];
   for (const group of groups) {
     // 페이지를 하나씩 순차 처리해 한 번에 여러 캔버스가 메모리에 남지 않게 합니다.
-    images.push(await createPrintPageImage(group, photos, photoType, { scale, quality }));
+    images.push(await createPrintPageImage(group, photos, photoType, { scale, quality, printContext }));
     if (shouldAbort && shouldAbort()) return { images: [], failedCount: 0, aborted: true };
   }
 
   return { images, failedCount, aborted: false };
 }
 
-async function loadPrintPhotos(photoType = activePhotoType) {
+async function loadPrintPhotos(photoType = activePhotoType, printContext = null) {
   const normalizedType = normalizePhotoType(photoType);
-  const slots = getPrintSlots(normalizedType);
+  const entries = printContext?.entries || state.entries;
+  const slots = getPrintSlots(normalizedType, printContext);
   const photoPairs = await Promise.all(
     slots.map(async (day) => {
-      const photoUrl = getTypedPhoto(getEntry(day), normalizedType).photoUrl;
+      const photoUrl = getTypedPhoto(entries?.[day] || {}, normalizedType).photoUrl;
       if (!photoUrl) return [day, { image: null, failed: false }];
       const image = await loadPrintPhoto(photoUrl);
       return [day, { image, failed: !image }];
@@ -4847,12 +5286,12 @@ async function createPrintPageImage(group, photos, photoType = activePhotoType, 
   const scale = options.scale || PRINT_MM_SCALE_EXPORT;
   const quality = options.quality || PRINT_EXPORT_JPEG_QUALITY;
 
-  let canvas = drawPrintPage(group, photos, true, photoType, scale);
+  let canvas = drawPrintPage(group, photos, true, photoType, scale, options.printContext || null);
   try {
     return await canvasToJpegDataUrl(canvas, quality);
   } catch (error) {
     console.warn("Photo canvas export failed. Retrying without photos.", error);
-    canvas = drawPrintPage(group, photos, false, photoType, scale);
+    canvas = drawPrintPage(group, photos, false, photoType, scale, options.printContext || null);
     return await canvasToJpegDataUrl(canvas, quality);
   }
 }
@@ -4877,10 +5316,21 @@ function printMm(value) {
 }
 
 function printPt(value) {
-  return value * (96 / 72) * (printMmScale / (96 / 25.4));
+  return printPtAtScale(value, printMmScale);
 }
 
-function drawPrintPage(group, photos, allowPhotos, photoType = activePhotoType, scale = PRINT_MM_SCALE_EXPORT) {
+function printPtAtScale(value, scale) {
+  return value * (25.4 / 72) * scale;
+}
+
+function drawPrintPage(
+  group,
+  photos,
+  allowPhotos,
+  photoType = activePhotoType,
+  scale = PRINT_MM_SCALE_EXPORT,
+  printContext = null
+) {
   // 그리는 동안만 배율을 바꿉니다. 아래 그리기 호출은 전부 동기라 중간에 섞이지 않습니다.
   const previousScale = printMmScale;
   printMmScale = scale;
@@ -4897,8 +5347,8 @@ function drawPrintPage(group, photos, allowPhotos, photoType = activePhotoType, 
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     drawPrintTitle(ctx);
-    drawPrintProjectName(ctx);
-    drawPrintTable(ctx, group, photos, allowPhotos, photoType);
+    drawPrintProjectName(ctx, printContext);
+    drawPrintTable(ctx, group, photos, allowPhotos, photoType, printContext);
 
     return canvas;
   } finally {
@@ -4929,11 +5379,11 @@ function drawPrintTitle(ctx) {
   ctx.restore();
 }
 
-function drawPrintProjectName(ctx) {
+function drawPrintProjectName(ctx, printContext = null) {
   const tableX = printMm((PRINT_PAGE_WIDTH_MM - PRINT_TABLE_WIDTH_MM) / 2);
   const titleHeightMm = 22 * 25.4 / 72;
   const tableY = printMm(PRINT_TITLE_TOP_MARGIN_MM + titleHeightMm + 16.9);
-  const text = `□ ${normalizeProjectName(state.projectName || DEFAULT_PROJECT_NAME)}`;
+  const text = `□ ${normalizeProjectName(printContext?.projectName ?? state.projectName ?? DEFAULT_PROJECT_NAME)}`;
   const fontPx = printPt(11);
   const textY = tableY - printMm(5.8);
 
@@ -4946,18 +5396,18 @@ function drawPrintProjectName(ctx) {
   ctx.restore();
 }
 
-function drawPrintTable(ctx, group, photos, allowPhotos, photoType = activePhotoType) {
+function drawPrintTable(ctx, group, photos, allowPhotos, photoType = activePhotoType, printContext = null) {
   const tableX = printMm((PRINT_PAGE_WIDTH_MM - PRINT_TABLE_WIDTH_MM) / 2);
   const titleHeightMm = 22 * 25.4 / 72;
   const tableY = printMm(PRINT_TITLE_TOP_MARGIN_MM + titleHeightMm + 16.9);
   const blockHeight = printMm(PRINT_TABLE_HEIGHT_MM / 2);
 
   group.forEach((day, index) => {
-    drawPrintBlockCanvas(ctx, day, tableX, tableY + blockHeight * index, photos, allowPhotos, photoType);
+    drawPrintBlockCanvas(ctx, day, tableX, tableY + blockHeight * index, photos, allowPhotos, photoType, printContext);
   });
 }
 
-function drawPrintBlockCanvas(ctx, day, x, y, photos, allowPhotos, photoType = activePhotoType) {
+function drawPrintBlockCanvas(ctx, day, x, y, photos, allowPhotos, photoType = activePhotoType, printContext = null) {
   const tableW = printMm(PRINT_TABLE_WIDTH_MM);
   const labelW = printMm(PRINT_LABEL_WIDTH_MM);
   const mainW = printMm(PRINT_MAIN_WIDTH_MM);
@@ -4978,13 +5428,21 @@ function drawPrintBlockCanvas(ctx, day, x, y, photos, allowPhotos, photoType = a
   if (!day) return;
 
   const photoInfo = photos[day] || { image: null, failed: false };
-  drawPrintPhoto(ctx, day, x, y, tableW, photoH, photoInfo, allowPhotos, photoType);
+  drawPrintPhoto(ctx, day, x, y, tableW, photoH, photoInfo, allowPhotos, photoType, printContext);
   drawCenteredPrintText(ctx, "위  치", x, infoY, labelW, infoH, 13, "Batang, serif");
-  drawPrintMainTextCanvas(ctx, state.pourPart || "", x + labelW, infoY, mainW, infoH, {
-    breakAfterFirstBracket: true,
-  });
-  if (!loadPrintDayLabelBlindMode()) {
-    drawCenteredPrintText(ctx, getPhotoSlotLabel(day, photoType), x + labelW + mainW, infoY, dayW, infoH, 13, "Batang, serif");
+  drawPrintMainTextCanvas(ctx, printContext?.pourPart ?? state.pourPart ?? "", x + labelW, infoY, mainW, infoH);
+  const printDayLabelBlind = printContext?.printDayLabelBlind ?? loadPrintDayLabelBlindMode();
+  if (!printDayLabelBlind) {
+    drawCenteredPrintText(
+      ctx,
+      getPhotoSlotLabel(day, photoType, printContext?.settings || state.settings),
+      x + labelW + mainW,
+      infoY,
+      dayW,
+      infoH,
+      13,
+      "Batang, serif"
+    );
   }
   drawCenteredPrintText(ctx, "내  용", x, contentY, labelW, contentH, 13, "Batang, serif");
   drawPrintMainTextCanvas(ctx, getPhotoTypeConfig(photoType).contentText, x + labelW, contentY, mainW + dayW, contentH);
@@ -5000,7 +5458,18 @@ function drawPrintCell(ctx, x, y, width, height) {
   ctx.restore();
 }
 
-function drawPrintPhoto(ctx, day, x, y, width, height, photoInfo, allowPhotos, photoType = activePhotoType) {
+function drawPrintPhoto(
+  ctx,
+  day,
+  x,
+  y,
+  width,
+  height,
+  photoInfo,
+  allowPhotos,
+  photoType = activePhotoType,
+  printContext = null
+) {
   const info = photoInfo || { image: null, failed: false };
   const photoW = printMm(PRINT_PHOTO_WIDTH_MM);
   const photoH = printMm(PRINT_PHOTO_HEIGHT_MM);
@@ -5016,7 +5485,17 @@ function drawPrintPhoto(ctx, day, x, y, width, height, photoInfo, allowPhotos, p
   } else if (info.failed) {
     drawCenteredPrintText(ctx, "사진 불러오기 실패", photoX, photoY, photoW, photoH, 13, "Batang, serif");
   } else {
-    drawCenteredPrintText(ctx, getPrintMissingPhotoText(day, photoType), photoX, photoY, photoW, photoH, 13, "Batang, serif");
+    const entry = printContext ? printContext.entries?.[day] : undefined;
+    drawCenteredPrintText(
+      ctx,
+      getPrintMissingPhotoText(day, photoType, entry, Boolean(printContext)),
+      photoX,
+      photoY,
+      photoW,
+      photoH,
+      13,
+      "Batang, serif"
+    );
   }
 
   ctx.restore();
@@ -5042,30 +5521,49 @@ function drawCoverImage(ctx, image, x, y, width, height) {
 }
 
 function drawCenteredPrintText(ctx, text, x, y, width, height, fontPt, fontFamily) {
+  const horizontalInset = printMm(0.6);
+  const verticalInset = printMm(0.2);
+  const measureCtx = getPrintTextMeasureContext(fontPt, fontFamily);
+  const measureWidth = ((width - horizontalInset * 2) / printMmScale) * PRINT_MM_SCALE_EXPORT;
+  const isTooWide = measureCtx.measureText(String(text || "")).width > measureWidth;
+  const fittedText = fitPrintCanvasText(measureCtx, text, measureWidth, isTooWide ? "…" : "");
+
   ctx.save();
+  ctx.beginPath();
+  ctx.rect(x + horizontalInset, y + verticalInset, width - horizontalInset * 2, height - verticalInset * 2);
+  ctx.clip();
   ctx.fillStyle = "#000000";
   ctx.font = `${printPt(fontPt)}px ${fontFamily}`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(text, x + width / 2, y + height / 2);
+  ctx.fillText(fittedText, x + width / 2, y + height / 2);
   ctx.restore();
 }
 
-function drawPrintMainTextCanvas(ctx, text, x, y, width, height, options = {}) {
+function drawPrintMainTextCanvas(ctx, text, x, y, width, height) {
   const paddingX = printMm(1.8);
-  const fontPt = getPrintCanvasFontPt(text);
-  const fontPx = printPt(fontPt);
-  const lineHeight = fontPx * 1.12;
+  const explicitLineCount = getExplicitPrintCanvasSegments(text).length;
+  const maxLines = explicitLineCount >= 3 ? 3 : 2;
   const textX = x + paddingX;
   const textWidth = width - paddingX * 2;
+  const measureWidth = (textWidth / printMmScale) * PRINT_MM_SCALE_EXPORT;
+  const fontPt = getPrintCanvasFontPt(text, measureWidth);
+  const fontPx = printPt(fontPt);
+  const lineHeight = fontPx * (maxLines >= 3 ? 1 : 1.12);
+  const measureCtx = getPrintTextMeasureContext(fontPt);
 
   ctx.save();
+  const clipInsetX = printMm(0.15);
+  const clipInsetY = printMm(0.2);
+  ctx.beginPath();
+  ctx.rect(x + clipInsetX, y + clipInsetY, width - clipInsetX * 2, height - clipInsetY * 2);
+  ctx.clip();
   ctx.fillStyle = "#000000";
   ctx.font = `${fontPx}px "Batang", "HCR Batang", serif`;
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
 
-  const lines = getPrintCanvasLines(ctx, text, textWidth, 2, options);
+  const lines = getPrintCanvasLines(measureCtx, text, measureWidth, maxLines);
   const startY = y + height / 2 - ((lines.length - 1) * lineHeight) / 2;
 
   lines.forEach((line, index) => {
@@ -5075,122 +5573,99 @@ function drawPrintMainTextCanvas(ctx, text, x, y, width, height, options = {}) {
   ctx.restore();
 }
 
-function getPrintCanvasFontPt(text) {
+function getPrintTextMeasureContext(fontPt, fontFamily = '"Batang", "HCR Batang", serif') {
+  if (!printTextMeasureContext) {
+    printTextMeasureContext = document.createElement("canvas").getContext("2d");
+  }
+  printTextMeasureContext.font = `${printPtAtScale(fontPt, PRINT_MM_SCALE_EXPORT)}px ${fontFamily}`;
+  printTextMeasureContext.textAlign = "left";
+  printTextMeasureContext.textBaseline = "middle";
+  return printTextMeasureContext;
+}
+
+function getPrintCanvasFontPt(text, maxWidth = Infinity) {
+  const segments = getExplicitPrintCanvasSegments(text);
+  if (segments.length >= 3) return 9;
+  if (segments.length === 2 && Number.isFinite(maxWidth)) {
+    const candidates = [13, 11.5, 10, 9];
+    return candidates.find((fontPt) => {
+      const measureCtx = getPrintTextMeasureContext(fontPt);
+      return segments.every((segment) => measureCtx.measureText(segment).width <= maxWidth);
+    }) || 9;
+  }
   const lengthScore = getPrintTextLengthScore(text);
   if (lengthScore > 70) return 10;
   if (lengthScore > 52) return 11.5;
   return 13;
 }
 
-function getPrintCanvasLines(ctx, value, maxWidth, maxLines, options = {}) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  if (!text) return [""];
-  if (ctx.measureText(text).width <= maxWidth) return [text];
+function getExplicitPrintCanvasSegments(value) {
+  const segments = String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((segment) => segment.replace(/[\t ]+/g, " ").trim());
+  while (segments.length && !segments[0]) segments.shift();
+  while (segments.length && !segments[segments.length - 1]) segments.pop();
+  return segments;
+}
 
-  const segments = getPrintCanvasSegments(text, options);
-  const lines = [];
+function getPrintCanvasLines(ctx, value, maxWidth, maxLines) {
+  const segments = getExplicitPrintCanvasSegments(value);
+  if (!segments.length) return [""];
 
-  segments.forEach((segment) => {
-    if (lines.length >= maxLines) return;
-    wrapPrintCanvasSegment(ctx, segment, maxWidth).forEach((line) => {
-      if (lines.length < maxLines) {
-        lines.push(line);
-      }
+  // 사용자가 줄바꿈 위치를 지정했으면 각 입력 줄을 출력 한 줄에 그대로 대응시킵니다.
+  // 한 부위가 길더라도 다음 부위의 줄을 밀어내지 않고 해당 줄 안에서만 말줄임합니다.
+  if (segments.length > 1) {
+    const hasHiddenSegments = segments.length > maxLines;
+    return segments.slice(0, maxLines).map((segment, index, visibleSegments) => {
+      const isLastVisibleLine = index === visibleSegments.length - 1;
+      const isTooWide = ctx.measureText(segment).width > maxWidth;
+      const suffix = isTooWide || (hasHiddenSegments && isLastVisibleLine) ? "…" : "";
+      return fitPrintCanvasText(ctx, segment, maxWidth, suffix);
     });
-  });
-
-  if (!lines.length) return [""];
-
-  const hasHiddenText = segments.join(" ").length > lines.join(" ").length;
-  if (hasHiddenText && lines.length >= maxLines) {
-    lines[maxLines - 1] = fitPrintCanvasText(ctx, lines[maxLines - 1], maxWidth, "…");
   }
 
-  return lines.slice(0, maxLines);
-}
-
-function getPrintCanvasSegments(text, options = {}) {
-  if (!options.breakAfterFirstBracket || getPrintTextLengthScore(text) <= 18) {
-    return [text];
+  const wrappedLines = wrapPrintCanvasSegment(ctx, segments[0], maxWidth);
+  const lines = wrappedLines.slice(0, maxLines);
+  if (wrappedLines.length > maxLines && lines.length) {
+    lines[lines.length - 1] = fitPrintCanvasText(ctx, lines[lines.length - 1], maxWidth, "…");
   }
-
-  const chars = Array.from(text);
-  const majorCommaBreakIndex = findTopLevelPrintBreakIndex(chars, [",", "，", "、"], (source, index) => {
-    return source.slice(index + 1).join("").trimStart().toUpperCase().startsWith("STA.");
-  });
-  if (majorCommaBreakIndex >= 0) {
-    return [
-      chars.slice(0, majorCommaBreakIndex + 1).join("").trim(),
-      chars.slice(majorCommaBreakIndex + 1).join("").trim(),
-    ].filter(Boolean);
-  }
-
-  const closeBracketIndex = chars.findIndex((char, index) => {
-    return [")", "]", "}"].includes(char) && index < chars.length - 1;
-  });
-
-  if (closeBracketIndex >= 0) {
-    return [
-      chars.slice(0, closeBracketIndex + 1).join("").trim(),
-      chars.slice(closeBracketIndex + 1).join("").trim(),
-    ].filter(Boolean);
-  }
-
-  const commaBreakIndex = findTopLevelPrintBreakIndex(chars, [",", "，", "、"]);
-  if (commaBreakIndex >= 0) {
-    return [
-      chars.slice(0, commaBreakIndex + 1).join("").trim(),
-      chars.slice(commaBreakIndex + 1).join("").trim(),
-    ].filter(Boolean);
-  }
-
-  return [text];
-}
-
-function findTopLevelPrintBreakIndex(chars, delimiters, predicate = null) {
-  let depth = 0;
-  for (let index = 0; index < chars.length; index += 1) {
-    const char = chars[index];
-    if (["(", "[", "{"].includes(char)) {
-      depth += 1;
-      continue;
-    }
-    if ([")", "]", "}"].includes(char)) {
-      depth = Math.max(0, depth - 1);
-      continue;
-    }
-    if (
-      depth === 0 &&
-      delimiters.includes(char) &&
-      index < chars.length - 1 &&
-      (!predicate || predicate(chars, index))
-    ) {
-      return index;
-    }
-  }
-  return -1;
+  return lines.length ? lines : [""];
 }
 
 function wrapPrintCanvasSegment(ctx, segment, maxWidth) {
   if (ctx.measureText(segment).width <= maxWidth) return [segment];
 
-  const tokens = segment.split(/(\s+)/).filter(Boolean);
+  let remainingChars = Array.from(String(segment || "").trim());
   const lines = [];
-  let line = "";
 
-  tokens.forEach((token) => {
-    const candidate = `${line}${token}`;
-    if (!line || ctx.measureText(candidate).width <= maxWidth) {
-      line = candidate;
-      return;
+  while (remainingChars.length) {
+    let fitCount = 0;
+    while (
+      fitCount < remainingChars.length &&
+      ctx.measureText(remainingChars.slice(0, fitCount + 1).join("")).width <= maxWidth
+    ) {
+      fitCount += 1;
     }
 
-    lines.push(fitPrintCanvasText(ctx, line.trim(), maxWidth));
-    line = token.trimStart();
-  });
+    if (fitCount >= remainingChars.length) {
+      lines.push(remainingChars.join("").trim());
+      break;
+    }
 
-  if (line) {
-    lines.push(fitPrintCanvasText(ctx, line.trim(), maxWidth));
+    fitCount = Math.max(1, fitCount);
+    let breakCount = fitCount;
+    for (let index = fitCount - 1; index > 0; index -= 1) {
+      if (/\s/.test(remainingChars[index])) {
+        breakCount = index;
+        break;
+      }
+    }
+
+    const line = remainingChars.slice(0, breakCount).join("").trim();
+    if (line) lines.push(line);
+    remainingChars = remainingChars.slice(breakCount);
+    while (remainingChars.length && /\s/.test(remainingChars[0])) remainingChars.shift();
   }
 
   return lines;
@@ -5213,15 +5688,37 @@ async function handlePrint() {
     showToast("현재 저장 작업이 끝난 뒤 PDF를 만들어 주세요.");
     return;
   }
+  await flushMetaSave();
 
   elements.printButton.disabled = true;
   beginPhotoMutation();
+  setPrintInteractionLocked(true);
   showToast("출력 파일을 준비하는 중입니다.");
   try {
+    const printContext = createPrintRenderContext();
+    const filename = buildPdfFilename(printContext);
     // 미리보기 캐시(저해상도)가 아니라 인쇄 해상도로 새로 만듭니다.
-    const { images, failedCount } = await getPrintExportImages();
+    const { images, failedCount } = await getPrintExportImages(printContext);
     if (!images.length) {
       showToast(`${getPhotoTypeConfig(activePhotoType).sectionTitle}이 없습니다.`);
+      return;
+    }
+
+    // 버튼을 누르기 직전 입력까지 실제 PDF와 같은 이미지로 미리보기에 먼저 반영합니다.
+    const printSignature = getPrintImageSignature(printContext);
+    if (printSignature !== getPrintImageSignature()) {
+      showToast("출력 준비 중 정보가 갱신되었습니다. 최신 미리보기를 확인한 뒤 PDF를 다시 눌러 주세요.");
+      renderPrintArea();
+      return;
+    }
+    printImageCache = { signature: printSignature, images, failedCount };
+    renderPrintPreviewImages(images);
+    await waitForPrintPreviewPaint();
+
+    if (
+      isPrintMainTextOverflowing(printContext.pourPart) &&
+      !window.confirm("타설부위 일부가 출력 칸을 넘어 ‘…’로 표시됩니다. 최신 미리보기 내용대로 계속할까요?")
+    ) {
       return;
     }
 
@@ -5229,7 +5726,7 @@ async function handlePrint() {
       showToast(`사진 ${failedCount}장을 불러오지 못해 '사진 불러오기 실패'로 표시됩니다. 잠시 후 다시 시도해 보세요.`);
     }
 
-    const saved = await savePrintPdf(images);
+    const saved = await savePrintPdf(images, filename, printContext);
     if (saved) {
       const savedText = isKakaoInAppBrowser() ? "PDF 다운로드를 시작합니다." : "PDF를 저장했습니다.";
       showToast(failedCount > 0 ? `${savedText} (일부 사진 로드 실패)` : savedText);
@@ -5242,12 +5739,63 @@ async function handlePrint() {
     console.error(error);
     showToast("출력 파일을 만들지 못했습니다.");
   } finally {
-    elements.printButton.disabled = false;
     await endPhotoMutation();
+    setPrintInteractionLocked(false);
+    elements.printButton.disabled = false;
   }
 }
 
-async function savePrintPdf(images) {
+function waitForPrintPreviewPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+  });
+}
+
+function isPrintMainTextOverflowing(text) {
+  const segments = getExplicitPrintCanvasSegments(text);
+  if (!segments.length) return false;
+
+  const maxLines = segments.length >= 3 ? 3 : 2;
+  const maxWidth = (PRINT_MAIN_WIDTH_MM - 1.8 * 2) * PRINT_MM_SCALE_EXPORT;
+  const fontPt = getPrintCanvasFontPt(text, maxWidth);
+  const measureCtx = getPrintTextMeasureContext(fontPt);
+
+  if (segments.length > 1) {
+    return segments.length > maxLines || segments.some((segment) => measureCtx.measureText(segment).width > maxWidth);
+  }
+  return wrapPrintCanvasSegment(measureCtx, segments[0], maxWidth).length > maxLines;
+}
+
+function setPrintInteractionLocked(locked) {
+  const controls = [
+    elements.projectNameInput,
+    elements.pourPartInput,
+    elements.pourPartLineBreakButton,
+    elements.pourDateInput,
+    elements.prevPourDateButton,
+    elements.nextPourDateButton,
+    elements.newBoardButton,
+  ].filter(Boolean);
+
+  if (locked) {
+    printLockedControlStates = controls.map((control) => ({ control, disabled: control.disabled }));
+    controls.forEach((control) => {
+      control.disabled = true;
+    });
+    elements.mainLayout?.setAttribute("inert", "");
+    elements.mainLayout?.setAttribute("aria-busy", "true");
+    return;
+  }
+
+  printLockedControlStates.forEach(({ control, disabled }) => {
+    if (control?.isConnected) control.disabled = disabled;
+  });
+  printLockedControlStates = [];
+  elements.mainLayout?.removeAttribute("inert");
+  elements.mainLayout?.removeAttribute("aria-busy");
+}
+
+async function savePrintPdf(images, filename = buildPdfFilename(), printContext = null) {
   let jsPdfCtor = null;
   try {
     jsPdfCtor = await ensureJsPdf();
@@ -5267,11 +5815,9 @@ async function savePrintPdf(images) {
       pdf.addImage(src, "JPEG", 0, 0, pageW, pageH, undefined, "FAST");
     });
 
-    const filename = buildPdfFilename();
-
     if (isKakaoInAppBrowser()) {
       const blob = pdf.output("blob");
-      return await deliverPdfViaStorage(blob, filename);
+      return await deliverPdfViaStorage(blob, filename, printContext);
     }
 
     pdf.save(filename);
@@ -5282,10 +5828,12 @@ async function savePrintPdf(images) {
   }
 }
 
-async function deliverPdfViaStorage(blob, filename) {
-  if (!dbClient || !state.shareCode) return false;
+async function deliverPdfViaStorage(blob, filename, printContext = null) {
+  const shareCode = printContext?.shareCode || state.shareCode;
+  const photoType = printContext?.photoType || activePhotoType;
+  if (!dbClient || !shareCode) return false;
 
-  const path = `${state.shareCode}/pdf/${normalizePhotoType(activePhotoType)}.pdf`;
+  const path = `${shareCode}/pdf/${normalizePhotoType(photoType)}.pdf`;
   const { error: uploadError } = await dbClient.storage
     .from(config.bucket)
     .upload(path, blob, { contentType: "application/pdf", upsert: true });
@@ -5302,10 +5850,19 @@ async function deliverPdfViaStorage(blob, filename) {
   return true;
 }
 
-function buildPdfFilename() {
-  const part = (state.pourPart || "사진대지").replace(/[\\/:*?"<>|]/g, "_").trim() || "사진대지";
-  const typeLabel = getPhotoTypeConfig(activePhotoType).label || "";
-  const date = state.pourDate ? `_${state.pourDate}` : "";
+function buildPdfFilename(printContext = null) {
+  const pourPart = printContext?.pourPart ?? state.pourPart;
+  const photoType = printContext?.photoType || activePhotoType;
+  const pourDate = printContext?.pourDate ?? state.pourDate;
+  const inlinePart = getExplicitPrintCanvasSegments(pourPart).join("_") || "사진대지";
+  const safePart = inlinePart
+    .replace(/[\u0000-\u001f\\/:*?"<>|]+/g, "_")
+    .replace(/\s+/g, " ")
+    .replace(/[. ]+$/g, "")
+    .trim() || "사진대지";
+  const part = Array.from(safePart).slice(0, 120).join("") || "사진대지";
+  const typeLabel = getPhotoTypeConfig(photoType).label || "";
+  const date = pourDate ? `_${pourDate}` : "";
   return `${part}_${typeLabel}${date}.pdf`;
 }
 
@@ -5438,10 +5995,11 @@ async function createNewBoard() {
     projectName: DEFAULT_PROJECT_NAME,
     pourPart: "",
     pourDate: toDateInputValue(new Date()),
+    updatedAt: "",
     entries: {},
     settings: getLegacyBoardSettings(),
   };
-  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
+  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate, updatedAt: "" };
   boardResultSelectedGroup = null;
 
   if (dbClient) {
@@ -5491,7 +6049,7 @@ async function deleteBoardByShareCode(shareCode) {
   }
 
   const photoCount = countPhotoEntries(target.entries || {});
-  const pourPart = target.pourPart || "미입력";
+  const pourPart = getPourPartInlineText(target.pourPart);
   const confirmed = await confirmDangerousAction({
     title: "사진대지 삭제",
     message:
@@ -5848,15 +6406,21 @@ async function openBoard(shareCode) {
     shareCode,
     boardId: selectedBoard?.boardId || null,
     projectName: selectedBoard?.projectName || DEFAULT_PROJECT_NAME,
-    pourPart: selectedBoard?.pourPart || "",
+    pourPart: normalizePourPartValue(selectedBoard?.pourPart),
     pourDate: selectedBoard?.pourDate || toDateInputValue(new Date()),
     createdAt: selectedBoard?.createdAt || "",
+    updatedAt: selectedBoard?.updatedAt || "",
     entries: cachedEntries,
     settings: normalizeBoardSettings(selectedBoard?.settings, {
       fallback: loadBoardSettingsFallback(shareCode) || getLegacyBoardSettings(),
     }),
   };
-  lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate };
+  lastSyncedMeta = {
+    projectName: state.projectName,
+    pourPart: state.pourPart,
+    pourDate: state.pourDate,
+    updatedAt: state.updatedAt || "",
+  };
   syncInputsFromState();
   closePhotoViewer();
   renderAll();
@@ -5894,6 +6458,19 @@ function setSyncStatus(message) {
 
 function isMetaInputFocused() {
   return [elements.projectNameInput, elements.pourPartInput, elements.pourDateInput].includes(document.activeElement);
+}
+
+function isMetaInputDirty() {
+  const inputMeta = {
+    projectName: normalizeProjectName(elements.projectNameInput?.value || DEFAULT_PROJECT_NAME),
+    pourPart: normalizePourPartValue(elements.pourPartInput?.value),
+    pourDate: elements.pourDateInput?.value || "",
+  };
+  return (
+    inputMeta.projectName !== normalizeProjectName(lastSyncedMeta.projectName || DEFAULT_PROJECT_NAME) ||
+    inputMeta.pourPart !== normalizePourPartValue(lastSyncedMeta.pourPart) ||
+    inputMeta.pourDate !== String(lastSyncedMeta.pourDate || "")
+  );
 }
 
 function getKnownPhotoBytes() {
@@ -6214,4 +6791,14 @@ function escapeAttribute(value) {
 function normalizeProjectName(value) {
   const text = String(value == null ? "" : value).trim();
   return text || DEFAULT_PROJECT_NAME;
+}
+
+function normalizePourPartValue(value) {
+  const text = String(value == null ? "" : value).replace(/\r\n?/g, "\n");
+  return /\S/u.test(text) ? text : "";
+}
+
+function getPourPartInlineText(value, fallback = "미입력") {
+  const text = normalizePourPartValue(value).replace(/\s+/gu, " ").trim();
+  return text || fallback;
 }
