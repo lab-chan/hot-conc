@@ -1064,6 +1064,7 @@ function resetCurrentBoard(options = {}) {
   };
   lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate, updatedAt: "" };
   syncInputsFromState();
+  applyAdminModeUi();
 }
 
 function loadLocalBoard() {
@@ -1158,9 +1159,9 @@ async function loadCloudBoard(options = {}) {
   } else if (createIfMissing) {
     const createPayload = {
       share_code: requestedShareCode,
-      project_name: DEFAULT_PROJECT_NAME,
-      pour_part: "",
-      pour_date: toDateInputValue(new Date()),
+      project_name: normalizeProjectName(state.projectName || DEFAULT_PROJECT_NAME),
+      pour_part: normalizePourPartValue(state.pourPart),
+      pour_date: state.pourDate || toDateInputValue(new Date()),
     };
     if (boardSettingsColumnAvailable !== false) {
       createPayload.settings = normalizeBoardSettings(state.settings);
@@ -1492,11 +1493,12 @@ function countVisibleBoardPhotos() {
 }
 
 async function shiftPourDate(offset) {
+  if (!canEditPourDate()) return;
   const current = elements.pourDateInput.value || state.pourDate || toDateInputValue(new Date());
   const next = addDays(current, offset);
   elements.pourDateInput.value = toDateInputValue(next);
   pullMetaFromInputs();
-  await saveMeta();
+  if (state.shareCode) await saveMeta();
   boardResultSelectedGroup = null;
   renderAll();
 }
@@ -2807,11 +2809,20 @@ function setAdminMode(on) {
 
 function applyAdminModeUi() {
   document.body.classList.toggle("admin-mode", isAdminMode);
-  // 타설일은 관리자 모드에서만 편집 가능(일반 모드는 잠금).
-  if (elements.pourDateInput) elements.pourDateInput.readOnly = !isAdminMode;
-  if (elements.prevPourDateButton) elements.prevPourDateButton.disabled = !isAdminMode;
-  if (elements.nextPourDateButton) elements.nextPourDateButton.disabled = !isAdminMode;
+  const dateEditable = canEditPourDate();
+  // 일반 모드는 기존 대지의 타설일만 잠그고, 새 대지 입력 중에는 날짜 선택을 허용합니다.
+  if (elements.pourDateInput) elements.pourDateInput.readOnly = !dateEditable;
+  if (elements.prevPourDateButton) elements.prevPourDateButton.disabled = !dateEditable;
+  if (elements.nextPourDateButton) elements.nextPourDateButton.disabled = !dateEditable;
   renderDaySlotBlindButton();
+}
+
+function isNewBoardDraft() {
+  return !state.shareCode;
+}
+
+function canEditPourDate() {
+  return isAdminMode || isNewBoardDraft();
 }
 
 function getWeatherFunctionUrl() {
@@ -4211,6 +4222,7 @@ function hasPhotoMemoData(photo) {
 }
 
 function renderAll() {
+  renderNewBoardButton();
   renderPhotoTypeControls();
   renderDaySlotBlindButton();
   renderBoardListExpandButton();
@@ -4222,6 +4234,17 @@ function renderAll() {
   }
   renderPrintArea();
   renderStorageMeter();
+}
+
+function renderNewBoardButton() {
+  if (!elements.newBoardButton) return;
+  const draft = isNewBoardDraft();
+  const label = elements.newBoardButton.querySelector("span:last-child");
+  if (label) label.textContent = draft ? "대지 만들기" : "새 대지";
+  elements.newBoardButton.title = draft
+    ? "선택한 날짜로 새 사진대지 만들기"
+    : "새 사진대지 입력 시작";
+  elements.newBoardButton.setAttribute("aria-label", elements.newBoardButton.title);
 }
 
 function renderMetaPreview() {
@@ -5977,8 +6000,9 @@ async function createNewBoard() {
   endFilePickNow();
   window.clearTimeout(metaSaveTimer);
   metaSaveTimer = null;
+  const hasCurrentBoard = Boolean(state.shareCode);
   const token = ++boardLoadToken;
-  if (state.shareCode) {
+  if (hasCurrentBoard) {
     await saveMeta();
     if (token !== boardLoadToken) return;
   }
@@ -5986,21 +6010,39 @@ async function createNewBoard() {
   if (token !== boardLoadToken) return;
   activePhotoType = DEFAULT_PHOTO_TYPE;
 
+  if (hasCurrentBoard) {
+    clearBoardUrlParam();
+    resetCurrentBoard();
+    boardResultSelectedGroup = null;
+    closePhotoViewer();
+    renderAll();
+    elements.pourDateInput?.focus();
+    showToast("날짜와 타설부위를 선택한 뒤 대지를 만들어 주세요.");
+    return;
+  }
+
+  pullMetaFromInputs();
+  const newBoardMeta = {
+    projectName: normalizeProjectName(state.projectName || DEFAULT_PROJECT_NAME),
+    pourPart: normalizePourPartValue(state.pourPart),
+    pourDate: state.pourDate || toDateInputValue(new Date()),
+  };
+
   const shareCode = createShareCode();
   clearBoardUrlParam();
 
   state = {
     shareCode,
     boardId: null,
-    projectName: DEFAULT_PROJECT_NAME,
-    pourPart: "",
-    pourDate: toDateInputValue(new Date()),
+    ...newBoardMeta,
+    createdAt: "",
     updatedAt: "",
     entries: {},
     settings: getLegacyBoardSettings(),
   };
   lastSyncedMeta = { projectName: state.projectName, pourPart: state.pourPart, pourDate: state.pourDate, updatedAt: "" };
   boardResultSelectedGroup = null;
+  applyAdminModeUi();
 
   if (dbClient) {
     await loadCloudBoard({ createIfMissing: true });
@@ -6012,7 +6054,7 @@ async function createNewBoard() {
 
   await loadBoardList();
   renderAll();
-  showToast("새 사진대지를 만들었습니다.");
+  showToast(`${formatListDate(state.pourDate)} 새 사진대지를 만들었습니다.`);
 }
 
 async function deleteCurrentBoard() {
@@ -6422,6 +6464,7 @@ async function openBoard(shareCode) {
     updatedAt: state.updatedAt || "",
   };
   syncInputsFromState();
+  applyAdminModeUi();
   closePhotoViewer();
   renderAll();
 
